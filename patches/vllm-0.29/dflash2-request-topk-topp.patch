@@ -1,0 +1,244 @@
+Give the DFlash and DFlash2 speculators per-request top-k / top-p under CUDA
+graphs.
+
+SamplingStates hands out its values from a rotating UVA pool, so the .gpu
+tensor is not a capture-stable pointer, and apply_staged_writes rotates those
+tensor objects on every engine step. The eager input-preparation kernel stages
+the current values into persistent device buffers, which the captured graph
+then reads; the owner is kept rather than the rotating tensors.
+
+--- exported from qwen38/0.29 785c607 (dflash2-request-topk-topp); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index 0ee0532..d62b1f9 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -456,6 +456,10 @@
+                     self.speculative_config,
+                     self.device,
+                 )
++            if self.speculator is not None and hasattr(
++                self.speculator, "set_sampling_states"
++            ):
++                self.speculator.set_sampling_states(self.sampler.sampling_states)
+             self.prompt_logprobs_worker = PromptLogprobsWorker(
+                 self.max_num_reqs,
+                 logprobs_mode=self.model_config.logprobs_mode,
+diff --git a/v1/worker/gpu/spec_decode/dflash/speculator.py b/v1/worker/gpu/spec_decode/dflash/speculator.py
+index dd1bfdd..c73cb38 100644
+--- a/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -97,10 +97,28 @@
+         self.sample_col = torch.arange(
+             self.num_speculative_steps, dtype=torch.int32, device=device
+         ).repeat(self.max_num_reqs)
++        # SamplingStates uses a rotating UVA pool, so its .gpu tensor is not a
++        # capture-stable pointer. The eager input-preparation kernel stages the
++        # current values into these persistent device buffers before graph replay.
++        self.request_top_p = torch.ones(
++            self.max_num_reqs, dtype=torch.float32, device=device
++        )
++        self.request_top_k = torch.full(
++            (self.max_num_reqs,),
++            self.vocab_size,
++            dtype=torch.int32,
++            device=device,
++        )
++        self._sampling_states: Any | None = None
+ 
+         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
+         self.draft_kv_cache_group_id: int = -1
+ 
++    def set_sampling_states(self, sampling_states: Any) -> None:
++        # Keep the owner, not sampling_states.top_{p,k}.gpu: apply_staged_writes
++        # rotates those UVA tensor objects on every engine step.
++        self._sampling_states = sampling_states
++
+     @property
+     def attn_vllm_config(self) -> VllmConfig:
+         # The draft's attention differs from the target's in causality.
+@@ -374,6 +392,18 @@
+             )
+             return self.draft_tokens[:num_reqs]
+ 
++        sampling_states = self._sampling_states
++        input_top_p = (
++            self.request_top_p
++            if sampling_states is None
++            else sampling_states.top_p.gpu
++        )
++        input_top_k = (
++            self.request_top_k
++            if sampling_states is None
++            else sampling_states.top_k.gpu
++        )
++
+         # The query slot mapping is written into the shared BlockTables slot_mappings.
+         # That buffer's address is what the captured CUDA graph reads from at replay.
+         assert self.draft_kv_cache_group_id >= 0
+@@ -389,6 +419,8 @@
+                 self.sample_idx_mapping,
+                 self.temperature,
+                 self.seeds,
++                self.request_top_p,
++                self.request_top_k,
+                 input_batch,
+                 num_sampled,
+                 num_rejected,
+@@ -396,6 +428,8 @@
+                 next_prefill_tokens,
+                 temperature,
+                 seeds,
++                input_top_p,
++                input_top_k,
+                 self.block_tables.input_block_tables[gid],
+                 self.block_tables.kernel_block_sizes[gid],
+                 self.block_tables.cp_rank,
+@@ -496,6 +530,8 @@
+     out_sample_idx_mapping_ptr,
+     out_temperature_ptr,
+     out_seeds_ptr,
++    out_top_p_ptr,
++    out_top_k_ptr,
+     # Inputs from target batch
+     target_positions_ptr,
+     target_query_start_loc_ptr,
+@@ -507,6 +543,8 @@
+     # Sampling params
+     temperature_ptr,
+     seeds_ptr,
++    top_p_ptr,
++    top_k_ptr,
+     # Block table for slot mapping lookup.
+     block_table_ptr,
+     block_table_stride,
+@@ -648,6 +686,14 @@
+             tl.load(temperature_ptr + req_state_idx),
+         )
+         tl.store(out_seeds_ptr + req_state_idx, tl.load(seeds_ptr + req_state_idx))
++        tl.store(
++            out_top_p_ptr + req_state_idx,
++            tl.load(top_p_ptr + req_state_idx),
++        )
++        tl.store(
++            out_top_k_ptr + req_state_idx,
++            tl.load(top_k_ptr + req_state_idx),
++        )
+         if req_idx == num_reqs - 1:
+             # Pad per-request buffers to max_num_reqs for CUDA graph safety.
+             last_query_end = num_reqs * num_query_per_req
+@@ -691,6 +737,8 @@
+     sample_idx_mapping: torch.Tensor,
+     temperature: torch.Tensor,
+     seeds: torch.Tensor,
++    top_p: torch.Tensor,
++    top_k: torch.Tensor,
+     input_batch: InputBatch,
+     # [num_reqs]
+     num_sampled: torch.Tensor,
+@@ -704,6 +752,10 @@
+     input_temperature: torch.Tensor,
+     # [max_num_reqs]
+     input_seeds: torch.Tensor,
++    # [max_num_reqs]
++    input_top_p: torch.Tensor,
++    # [max_num_reqs]
++    input_top_k: torch.Tensor,
+     # [max_num_reqs, max_num_blocks]
+     block_table: torch.Tensor,
+     block_size: int,
+@@ -739,6 +791,8 @@
+         sample_idx_mapping,
+         temperature,
+         seeds,
++        top_p,
++        top_k,
+         input_batch.positions,
+         input_batch.query_start_loc,
+         input_batch.idx_mapping,
+@@ -748,6 +802,8 @@
+         num_rejected,
+         input_temperature,
+         input_seeds,
++        input_top_p,
++        input_top_k,
+         block_table,
+         block_table.stride(0),
+         parallel_drafting_token_id,
+diff --git a/v1/worker/gpu/spec_decode/dflash2/speculator.py b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index 1cd19ac..be27c20 100644
+--- a/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -22,6 +22,8 @@
+     seeds_ptr,
+     tokens_ptr,
+     realized_scores_ptr,
++    request_top_p_ptr,
++    request_top_k_ptr,
+     num_steps: tl.constexpr,
+     top_k: tl.constexpr,
+     BLOCK_K: tl.constexpr,
+@@ -35,6 +37,9 @@
+     valid = req_state >= 0
+     temperature = tl.load(temperature_ptr + req_state, mask=valid, other=0.0)
+     seed = tl.load(seeds_ptr + req_state, mask=valid, other=0)
++    request_top_p = tl.load(request_top_p_ptr + req_state, mask=valid, other=1.0)
++    request_top_k = tl.load(request_top_k_ptr + req_state, mask=valid, other=top_k)
++    request_top_k = tl.maximum(1, tl.minimum(request_top_k, top_k))
+     previous = 0
+     for step in range(num_steps):
+         flat = row * num_steps + step
+@@ -51,6 +56,44 @@
+             other=0,
+         )
+ 
++        if SAMPLE_PROBABILISTIC:
++            if temperature != 0.0:
++                # Mirror vLLM's ordering: temperature, top-k, renormalize,
++                # then top-p. K is tiny (16 for Qwen3.8 DFlash2), so a
++                # deterministic all-pairs rank stays entirely in registers.
++                scaled_scores = scores.to(tl.float32) / temperature
++                score_j = scaled_scores[None, :]
++                score_i = scaled_scores[:, None]
++                token_j = candidates[None, :]
++                token_i = candidates[:, None]
++                precedes = (score_j > score_i) | (
++                    (score_j == score_i) & (token_j < token_i)
++                )
++                precedes = precedes & mask[None, :]
++                rank = tl.sum(precedes.to(tl.int32), axis=1)
++                keep_k = mask & valid & (rank < request_top_k)
++
++                top_k_scores = tl.where(
++                    keep_k, scaled_scores, float("-inf")
++                )
++                max_score = tl.max(top_k_scores, axis=0)
++                weights = tl.where(
++                    keep_k, tl.exp(top_k_scores - max_score), 0.0
++                )
++                probabilities = weights / tl.sum(weights, axis=0)
++                mass_before = tl.sum(
++                    tl.where(
++                        precedes & keep_k[None, :],
++                        probabilities[None, :],
++                        0.0,
++                    ),
++                    axis=1,
++                )
++                keep = keep_k & (
++                    (request_top_p >= 1.0) | (mass_before < request_top_p)
++                )
++                scores = tl.where(keep, scores, float("-inf"))
++
+         # sample_pos is the predicted token's position P. Sampling keys a draw
+         # by the position before the sampled token, P-1.
+         sample_pos = tl.load(sample_pos_ptr + flat) - 1
+@@ -152,6 +195,8 @@
+             self.seeds,
+             self.draft_tokens,
+             self._selector_scores,
++            self.request_top_p,
++            self.request_top_k,
+             num_steps=self.num_speculative_steps,
+             top_k=self.selector_top_k,
+             BLOCK_K=block_k,

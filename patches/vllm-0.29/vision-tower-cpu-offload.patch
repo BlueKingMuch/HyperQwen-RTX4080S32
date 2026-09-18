@@ -1,0 +1,106 @@
+Keep the bulk of the Qwen3 vision tower's weights in host RAM, under a
+dedicated budget, so the visual path costs host memory instead of VRAM.
+
+Registers VLLM_VISION_CPU_OFFLOAD_GB (GiB, 0 disables) and reads it through
+vllm.envs, so the knob is part of the torch.compile cache key.
+
+--- exported from qwen38/0.29 24514f9 (vision-tower-cpu-offload); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/envs.py b/envs.py
+index 786864b..a0278a1 100755
+--- a/envs.py
++++ b/envs.py
+@@ -298,6 +298,7 @@
+     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
++    VLLM_VISION_CPU_OFFLOAD_GB: float = 0.0
+     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
+     VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
+@@ -2045,6 +2046,10 @@
+     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
+         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
+     ),
++    # Dedicated Qwen3 vision-tower weight-offload budget in GiB.
++    "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
++        os.getenv("VLLM_VISION_CPU_OFFLOAD_GB", "0")
++    ),
+     # Disable using pytorch's pin memory for CPU offloading.
+     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
+         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
+diff --git a/model_executor/models/qwen3_vl.py b/model_executor/models/qwen3_vl.py
+index dd08f1c..385c7bf 100644
+--- a/model_executor/models/qwen3_vl.py
++++ b/model_executor/models/qwen3_vl.py
+@@ -24,9 +24,16 @@
+ # limitations under the License.
+ """Inference-only Qwen3VL model compatible with HuggingFace weights."""
+ 
+-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
++from collections.abc import (
++    Callable,
++    Generator,
++    Iterable,
++    Iterator,
++    Mapping,
++    Sequence,
++)
+ from functools import lru_cache, partial
+-from itertools import islice
++from itertools import chain, islice
+ from typing import Any
+ 
+ import numpy as np
+@@ -48,6 +55,7 @@
+ )
+ from transformers.video_utils import VideoMetadata
+ 
++import vllm.envs as envs
+ from vllm.compilation.decorators import (
+     should_torch_compile_mm_encoder,
+     support_torch_compile,
+@@ -552,6 +560,22 @@
+         return out
+ 
+ 
++def _bulk_offload_qwen3_vision_modules(
++    modules_generator: Generator[nn.Module, None, None],
++) -> list[nn.Module]:
++    cpu_offload_gb = envs.VLLM_VISION_CPU_OFFLOAD_GB
++    if cpu_offload_gb <= 0:
++        return list(modules_generator)
++
++    from vllm.model_executor.offloader import UVAOffloader
++
++    offloader = UVAOffloader(cpu_offload_max_bytes=int(cpu_offload_gb * 1024**3))
++    # Keep GEMMs on device-local weights. UVA zero-copy would make every GEMM
++    # read its weight tiles over PCIe instead of copying each module once.
++    offloader.uva_offloading = False
++    return offloader.wrap_modules(modules_generator)
++
++
+ class Qwen3_VisionTransformer(nn.Module):
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_stacked={
+@@ -666,6 +690,20 @@
+             ]
+         )
+ 
++        if envs.VLLM_VISION_CPU_OFFLOAD_GB > 0:
++            deepstack_merger_end = 1 + len(self.deepstack_merger_list)
++            vision_modules = _bulk_offload_qwen3_vision_modules(
++                module
++                for module in chain(
++                    (self.merger,), self.deepstack_merger_list, self.blocks
++                )
++            )
++            self.merger = vision_modules[0]
++            self.deepstack_merger_list = nn.ModuleList(
++                vision_modules[1:deepstack_merger_end]
++            )
++            self.blocks = nn.ModuleList(vision_modules[deepstack_merger_end:])
++
+     @property
+     def dtype(self) -> torch.dtype:
+         return self.patch_embed.proj.weight.dtype

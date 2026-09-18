@@ -1,0 +1,42 @@
+Triton 3D reducer: make CUDA-graph padding rows deterministic.
+
+The producer kernel returns without writing segment scratch for padded query
+rows whose sequence length is zero. The reducer continued into cdiv(0, 0),
+where an undefined segment mask can expose unwritten scratch. Write a zero
+output row and return before the segment arithmetic instead.
+
+Correctness only. The existing max_seqlen_q > 1 exclusion is unchanged, so
+this does not by itself enable multi-query 3D Split-KV attention.
+
+--- exported from qwen38/0.29 dbb2e7b (triton-zero-length-segment-guard); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/attention/ops/triton_unified_attention.py b/v1/attention/ops/triton_unified_attention.py
+index ce4a85c..f0a6306 100644
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -715,6 +715,25 @@
+     # sequence len for this particular sequence
+     seq_len = tl.load(seq_lens_ptr + seq_idx)
+ 
++    # CUDA-graph padding rows have no sequence and the producer therefore
++    # writes no segment scratch.  Do not evaluate cdiv(0, 0) or read those
++    # unwritten partials: make the padded output deterministic and leave.
++    if seq_len == 0:
++        _z_dim_mask = tl.where(
++            tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0
++        ).to(tl.int1)
++        _z_offset = (
++            query_token_idx * output_stride_0
++            + query_head_idx * output_stride_1
++            + tl.arange(0, HEAD_SIZE_PADDED)
++        )
++        tl.store(
++            output_ptr + _z_offset,
++            tl.zeros([HEAD_SIZE_PADDED], dtype=output_ptr.dtype.element_ty),
++            mask=_z_dim_mask,
++        )
++        return
++
+     # number of segments for this particular sequence
+     num_segments = NUM_SEGMENTS_PER_SEQ
+     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)

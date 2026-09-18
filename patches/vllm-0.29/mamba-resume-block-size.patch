@@ -1,0 +1,45 @@
+Resume Mamba state in the Mamba group's own token geometry.
+
+The shared generic block_size can describe a differently quantized drafter, so
+using it to resume puts the prefix-state column and the prefill chunk
+boundaries in the wrong place. Take the geometry from the Mamba group instead,
+as preprocess_state already does for subsequent steps.
+
+--- exported from qwen38/0.29 c100ddc (mamba-resume-block-size); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/core/sched/scheduler.py b/v1/core/sched/scheduler.py
+index 83ed597..7b760f4 100644
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -409,7 +409,10 @@
+         if start >= prefill_end:
+             return num_new_tokens
+ 
+-        block_size = self.cache_config.block_size
++        # Chunk boundaries follow the Mamba state geometry. The shared
++        # generic block_size may instead describe a differently sized draft
++        # attention group after KV cache page-size unification.
++        block_size = self.cache_config.mamba_block_size
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+diff --git a/v1/worker/gpu/model_states/mamba_hybrid.py b/v1/worker/gpu/model_states/mamba_hybrid.py
+index 6d07c15..91686f0 100644
+--- a/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -117,9 +117,13 @@
+         # Must reset the speculative acceptance count in this idx which could be stale.
+         self.num_accepted_tokens_gpu[req_index].fill_(1)
+         if self._align_mode:
+-            # Seed the running state block from the resumed/prefilled position.
++            # The shared config's generic block_size can be changed by a
++            # differently quantized drafter. Resume in the Mamba group's own
++            # token geometry, as preprocess_state does for subsequent steps.
++            mamba_block_size = self.cache_config.mamba_block_size
++            assert mamba_block_size is not None and mamba_block_size > 0
+             self._mamba_state_idx_gpu[req_index].fill_(
+-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
++                (new_req_data.num_computed_tokens - 1) // mamba_block_size
+             )
+ 
+     def _get_mamba_group_info(

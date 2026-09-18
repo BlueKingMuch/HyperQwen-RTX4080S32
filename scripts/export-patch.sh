@@ -6,6 +6,10 @@
 #   bash scripts/export-patch.sh <fork checkout> <commit> [patches/<name>.patch]
 set -eu
 FORK="$1"; COMMIT="$2"; OUT="${3:-}"
+# The fork the topic commits live in, as it should read in the exported file's
+# footer. Defaults to the one this repo's own series is exported from; a fork
+# that carries its series on its own branch sets FORK_NAME to that fork.
+FORK_NAME="${FORK_NAME:-cpuchip/vllm}"
 G="git -C $FORK"
 SUBJ=$($G log -1 --format='%s' "$COMMIT"); TOPIC=$(echo "$SUBJ" | sed -nE 's/^\[qwen38\] ([A-Za-z0-9._-]+).*/\1/p')
 [ -n "$TOPIC" ] || { echo "not a topic commit: $SUBJ"; exit 1; }
@@ -16,7 +20,7 @@ BODY=$($G log -1 --format='%b' "$COMMIT" | sed -e '/^Source: /,$d' | grep -vE '^
 SHORT=$($G rev-parse --short "$COMMIT")
 {
   printf '%s\n\n' "$BODY"
-  printf -- '--- exported from cpuchip/vllm %s (%s); regenerate with scripts/export-patch.sh, do not edit ---\n\n' "$SHORT" "$TOPIC"
+  printf -- '--- exported from %s %s (%s); regenerate with scripts/export-patch.sh, do not edit ---\n\n' "$FORK_NAME" "$SHORT" "$TOPIC"
   # strip the vllm/ prefix from the paths and the function context git appends to hunk headers
   $G diff "$COMMIT^" "$COMMIT" -- vllm \
     | sed -E 's#^(--- |\+\+\+ )([ab])/vllm/#\1\2/#' \
