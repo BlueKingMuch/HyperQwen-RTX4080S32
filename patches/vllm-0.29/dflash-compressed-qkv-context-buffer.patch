@@ -1,0 +1,104 @@
+Teach the native DFlash context-KV fusion to consume the compressed-tensors
+WNA16 loader representation. The draft checkpoint uses symmetric W4A16 group
+quantization, so QKVParallelLinear owns weight_packed and weight_scale rather
+than a dense weight parameter while load_weights runs.
+
+The normal compressed-tensors loader and the later Marlin repack stay
+unchanged. Only the KV rows the one-time fused context projection buffer needs
+are materialized; asymmetric and activation-ordered layouts fail closed.
+
+--- exported from qwen38/0.29 7e4813c (dflash-compressed-qkv-context-buffer); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/model_executor/models/qwen3_dflash.py b/model_executor/models/qwen3_dflash.py
+index 0a481b3..1810d16 100644
+--- a/model_executor/models/qwen3_dflash.py
++++ b/model_executor/models/qwen3_dflash.py
+@@ -355,6 +355,79 @@
+         return hidden_states, residual
+ 
+ 
++def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
++    """Return dense KV rows from a plain or packed QKV projection.
++
++    DFlash builds one fused context-KV GEMM buffer while checkpoint weights are
++    still in their loader representation.  Unquantized linear layers expose a
++    dense ``weight`` parameter, whereas compressed-tensors WNA16 layers expose
++    symmetric, input-dimension-packed ``weight_packed`` plus ``weight_scale``.
++    Only the KV output rows are unpacked; the Q rows are never materialized.
++    """
++    qkv = attn.qkv_proj
++    weight = getattr(qkv, "weight", None)
++    if weight is not None:
++        if weight.ndim != 2:
++            raise ValueError(
++                f"DFlash expected a 2D QKV weight, got shape {tuple(weight.shape)}"
++            )
++        return weight[attn.q_size :]
++
++    packed = getattr(qkv, "weight_packed", None)
++    scale = getattr(qkv, "weight_scale", None)
++    scheme = getattr(qkv, "scheme", None)
++    if packed is None or scale is None or scheme is None:
++        raise TypeError(
++            "DFlash context-KV fusion requires either a dense QKV weight or "
++            "a compressed-tensors WNA16 weight_packed/weight_scale pair"
++        )
++    if not getattr(scheme, "symmetric", False) or getattr(
++        scheme, "has_g_idx", False
++    ):
++        raise NotImplementedError(
++            "DFlash context-KV fusion currently supports only symmetric "
++            "compressed-tensors WNA16 weights without activation ordering"
++        )
++
++    num_bits = int(getattr(scheme, "num_bits", 0))
++    if num_bits < 1 or num_bits > 8 or 32 % num_bits:
++        raise NotImplementedError(
++            f"DFlash cannot unpack compressed QKV weights with {num_bits} bits"
++        )
++    input_size = int(qkv.input_size_per_partition)
++    q_size = int(attn.q_size)
++    if packed.ndim != 2 or scale.ndim != 2:
++        raise ValueError("DFlash expected 2D packed QKV weights and scales")
++    if packed.shape[0] != scale.shape[0] or not 0 <= q_size < packed.shape[0]:
++        raise ValueError("DFlash packed QKV output rows do not match their scales")
++    groups = int(scale.shape[1])
++    if groups <= 0 or input_size % groups:
++        raise ValueError("DFlash packed QKV scales do not divide the input size")
++    group_size = input_size // groups
++    configured_group_size = int(getattr(scheme, "group_size", -1))
++    if configured_group_size not in {-1, group_size}:
++        raise ValueError(
++            "DFlash packed QKV scale geometry disagrees with its quantization scheme"
++        )
++
++    from compressed_tensors.compressors.pack_quantized.base import unpack_from_int32
++
++    packed_kv = packed[q_size:].data
++    scale_kv = scale[q_size:].data
++    kv_rows = int(packed_kv.shape[0])
++    quantized = unpack_from_int32(
++        packed_kv,
++        num_bits,
++        torch.Size([kv_rows, input_size]),
++        packed_dim=1,
++    )
++    dense = (
++        quantized.to(torch.float32).reshape(kv_rows, groups, group_size)
++        * scale_kv.to(torch.float32)[..., None]
++    ).reshape(kv_rows, input_size)
++    return dense.to(scale.dtype)
++
++
+ @support_torch_compile
+ class DFlashQwen3Model(nn.Module):
+     decoder_layer_cls = DFlashQwen3DecoderLayer
+@@ -469,7 +542,7 @@
+         self._hidden_norm_weight = self.hidden_norm.weight.data
+ 
+         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
++        kv_weights = [_dense_kv_rows(a) for a in layers_attn]
+         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+         if has_bias:
+             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]

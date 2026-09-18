@@ -1,0 +1,31 @@
+# Apply order for the vLLM 0.29.0 series, one basename per line.
+#
+# Read by patches/vllm-0.29/check_series.sh. This list and the directory must
+# agree exactly, in both directions.
+#
+# Several patches carry hunk context that an earlier one adds --
+# gdn-spec-state-recovery-core extends the kernel signatures that
+# vllm-pr50021-gdn-spec-bounds introduces, and fails on a pristine tree -- so
+# the order is a hard requirement, not a preference.
+#
+#   - a new independent patch goes on the last line
+#   - a patch that must apply before an existing one is listed before it
+
+dflash-compressed-qkv-context-buffer.patch
+vllm-pr50021-gdn-spec-bounds.patch
+gdn-spec-state-recovery-core.patch
+mamba-align-row-null-bounds.patch
+vision-tower-cpu-offload.patch
+gdn-persistent-recovery-buffer.patch
+gdn-persistent-recovery-copy.patch
+hybrid-kv-group-sizing.patch
+hybrid-kv-group-capacity-cost.patch
+dflash2-request-topk-topp.patch
+gdn-active-runtime-k-width.patch
+dflash2-prewarm.patch
+triton-zero-length-segment-guard.patch
+triton-fp8-mq3d-qmax8.patch
+triton-fp8-mq3d-dispatch-trace.patch
+mq3d-mixed-target.patch
+block-verification-invalid-draft.patch
+mamba-resume-block-size.patch

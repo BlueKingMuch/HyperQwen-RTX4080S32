@@ -1,0 +1,90 @@
+Size hybrid KV cache groups by preferring a padded sliding-window bucket over
+splitting one, so the smallest bucket does not decide the page size for every
+group that shares it.
+
+--- exported from qwen38/0.29 d2449d6 (hybrid-kv-group-sizing); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/core/kv_cache_utils.py b/v1/core/kv_cache_utils.py
+index 7572aac..afbe2b1 100644
+--- a/v1/core/kv_cache_utils.py
++++ b/v1/core/kv_cache_utils.py
+@@ -1202,6 +1202,69 @@
+     return not kv_cache_spec
+ 
+ 
++def _prefer_padding_sliding_window_buckets(
++    layer_buckets: list[list[str]],
++    spec_buckets: list[list[KVCacheSpec]],
++    group_size: int,
++) -> int:
++    """Reduce hybrid-cache padding by moving it to cheap SW buckets.
++
++    The default minimum-bucket heuristic can pad every large full-attention
++    or recurrent-state bucket when a small speculative sliding-window bucket
++    is present. Prefer a common divisor of the non-SW bucket sizes when that
++    strictly reduces the total padded layer slots and the additional SW
++    padding never exceeds the original SW bucket size.
++    """
++    sw_bucket_indices = {
++        i
++        for i, specs in enumerate(spec_buckets)
++        if specs and all(isinstance(spec, SlidingWindowSpec) for spec in specs)
++    }
++    if not sw_bucket_indices:
++        return group_size
++
++    min_bucket_size = min(len(layers) for layers in layer_buckets)
++    min_bucket_indices = {
++        i for i, layers in enumerate(layer_buckets) if len(layers) == min_bucket_size
++    }
++    if not min_bucket_indices.issubset(sw_bucket_indices):
++        return group_size
++
++    non_sw_counts = [
++        len(layers)
++        for i, layers in enumerate(layer_buckets)
++        if i not in sw_bucket_indices
++    ]
++    sw_counts = [len(layer_buckets[i]) for i in sw_bucket_indices]
++    if not non_sw_counts or all(count % group_size == 0 for count in non_sw_counts):
++        return group_size
++
++    common_divisor = math.gcd(*non_sw_counts)
++    current_slots = sum(
++        cdiv(len(layers), group_size) * group_size for layers in layer_buckets
++    )
++    for candidate in range(common_divisor, group_size, -1):
++        if common_divisor % candidate != 0:
++            continue
++        if any((-count) % candidate > count for count in sw_counts):
++            continue
++        candidate_slots = sum(
++            cdiv(len(layers), candidate) * candidate for layers in layer_buckets
++        )
++        if candidate_slots >= current_slots:
++            continue
++        logger.info(
++            "Hybrid KV cache group size increased from %d to %d; "
++            "padded layer slots reduced from %d to %d",
++            group_size,
++            candidate,
++            current_slots,
++            candidate_slots,
++        )
++        return candidate
++    return group_size
++
++
+ def _get_kv_cache_groups_uniform_page_size(
+     kv_cache_spec: dict[str, KVCacheSpec],
+ ) -> list[KVCacheGroupSpec]:
+@@ -1319,6 +1382,9 @@
+         # layers while accommodating speculative decoding drafters that add
+         # extra layers to one attention type.
+         group_size = max_num_layers
++    else:
++        group_size = _prefer_padding_sliding_window_buckets(
++            layer_buckets, spec_buckets, group_size)
+     grouped_layers = []
+     for layers in layer_buckets:
+         num_padding_layers = group_size - len(layers) % group_size

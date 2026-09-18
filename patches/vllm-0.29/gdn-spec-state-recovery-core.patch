@@ -1,0 +1,366 @@
+Carry the accepted-token source indices from the attention metadata into the
+GDN and causal-conv1d kernels, so a speculative step can recover the recurrent
+state from the row it was actually written to rather than from the row its
+sequential position implies.
+
+The kernels gain a num_accepted_tokens pointer, which may be None, and an
+IS_SPEC_DECODING constexpr that compiles the lookup away when it is not.
+
+--- exported from qwen38/0.29 afff7de (gdn-spec-state-recovery-core); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 108a732..9d19cf7 100644
+--- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -1316,6 +1316,33 @@
+         ssm_state = self_kv_cache[1]
+         num_actual_tokens = attn_metadata.num_actual_tokens
+         num_accepted_tokens = attn_metadata.num_accepted_tokens
++        spec_decode_src_indices = attn_metadata.spec_decode_src_indices
++        non_spec_num_accepted = attn_metadata.non_spec_num_accepted
++
++        if spec_decode_src_indices is not None:
++            assert non_spec_state_indices_tensor is not None
++            # PyTorch's CUDA index_copy requires int64 indices. Keep these
++            # device-side casts inside forward so CUDA Graph records them and
++            # refreshes the graph-owned int64 buffers on every replay.
++            src_indices = spec_decode_src_indices.to(dtype=torch.long)
++            n_correct = src_indices.numel()
++            dst_indices = non_spec_state_indices_tensor[:n_correct].to(
++                dtype=torch.long
++            )
++            # Snapshot the RHS before writing: source and destination block sets
++            # may overlap when several requests change mode in the same batch.
++            recovered_ssm = ssm_state.index_select(0, src_indices)
++            ssm_state.index_copy_(0, dst_indices, recovered_ssm)
++
++        conv_num_accepted = (
++            (
++                non_spec_num_accepted
++                if non_spec_num_accepted is not None
++                else num_accepted_tokens
++            )
++            if spec_decode_src_indices is not None
++            else None
++        )
+ 
+         mixed_qkv = mixed_qkv[:num_actual_tokens]
+         b = b[:num_actual_tokens]
+@@ -1375,6 +1402,7 @@
+                 has_initial_state=has_initial_state,
+                 cache_indices=non_spec_state_indices_tensor,
+                 query_start_loc=non_spec_query_start_loc,
++                num_accepted_tokens=conv_num_accepted,
+                 metadata=attn_metadata,
+             ).transpose(0, 1)
+         elif attn_metadata.num_decodes > 0:
+@@ -1388,6 +1416,7 @@
+                 conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                     : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+                 ],
++                num_accepted_tokens=conv_num_accepted,
+                 validate_data=True,
+             )
+         else:
+@@ -1667,7 +1696,22 @@
+         )
+         ssm_state = self_kv_cache[1]
+         num_actual_tokens = attn_metadata.num_actual_tokens
++        spec_decode_src_indices = attn_metadata.spec_decode_src_indices
++        num_accepted_tokens = attn_metadata.num_accepted_tokens
++
++        if spec_decode_src_indices is not None:
++            assert non_spec_state_indices_tensor is not None
++            src_indices = spec_decode_src_indices.to(dtype=torch.long)
++            n_correct = src_indices.numel()
++            dst_indices = non_spec_state_indices_tensor[:n_correct].to(
++                dtype=torch.long
++            )
++            recovered_ssm = ssm_state.index_select(0, src_indices)
++            ssm_state.index_copy_(0, dst_indices, recovered_ssm)
+ 
++        conv_num_accepted = (
++            num_accepted_tokens if spec_decode_src_indices is not None else None
++        )
+         mixed_qkv = mixed_qkv[:num_actual_tokens]
+         b = b[:num_actual_tokens]
+         a = a[:num_actual_tokens]
+@@ -1682,6 +1726,7 @@
+             self.conv1d.bias,
+             self.activation,
+             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
++            num_accepted_tokens=conv_num_accepted,
+             validate_data=False,
+         )
+         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+diff --git a/model_executor/layers/mamba/ops/causal_conv1d.py b/model_executor/layers/mamba/ops/causal_conv1d.py
+index e738748..11ed894 100644
+--- a/model_executor/layers/mamba/ops/causal_conv1d.py
++++ b/model_executor/layers/mamba/ops/causal_conv1d.py
+@@ -31,6 +31,7 @@
+     block_idx_last_scheduled_token,  # (batch,)
+     initial_state_idx,  # (batch,)
+     num_computed_tokens,  # (batch,)
++    num_accepted_tokens_ptr,  # (batch,) or None
+     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+     # Matrix dimensions
+     dim: tl.constexpr,
+@@ -55,6 +56,8 @@
+     KERNEL_WIDTH: tl.constexpr,
+     SILU_ACTIVATION: tl.constexpr,
+     IS_APC_ENABLED: tl.constexpr,
++    IS_SPEC_DECODING: tl.constexpr,
++    MAX_ACCEPTED_TOKENS: tl.constexpr,
+     HAS_NULL_BLOCK: tl.constexpr,
+     NP2_STATELEN: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+@@ -130,6 +133,25 @@
+     token_offset = BLOCK_M * chunk_offset
+     segment_len = min(BLOCK_M, seqlen - token_offset)
+ 
++    if IS_SPEC_DECODING:
++        num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
++        if (num_accepted < 1) | (num_accepted > MAX_ACCEPTED_TOKENS):
++            zero = tl.zeros((BLOCK_N,), dtype=tl.float32)
++            for idx_token in range(segment_len):
++                o_ptrs = (
++                    o_ptr
++                    + (sequence_start_index + token_offset + idx_token)
++                    * stride_o_token
++                    + idx_feats * stride_o_dim
++                )
++                tl.store(o_ptrs, zero, mask=idx_feats < dim)
++            if launch_pdl:
++                tl.extra.cuda.gdc_launch_dependents()
++            return
++        conv_state_token_offset = num_accepted - 1
++    else:
++        conv_state_token_offset = 0
++
+     # base of the sequence
+     x_base = (
+         x_ptr + sequence_start_index * stride_x_token + idx_feats * stride_x_dim
+@@ -162,7 +184,10 @@
+         load_init_state = tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
+         if load_init_state:
+             # load from conv_states
+-            prior_tokens = conv_states_base + (state_len - 1) * stride_conv_state_tok
++            prior_tokens = (
++                conv_states_base
++                + (state_len - 1 + conv_state_token_offset) * stride_conv_state_tok
++            )
+             mask_w = idx_feats < dim
+             if KERNEL_WIDTH == 2:
+                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
+@@ -252,7 +277,10 @@
+                     conv_states_ptr
+                     + (conv_states_input_coord * stride_conv_state_seq)
+                     + (idx_feats * stride_conv_state_dim)[None, :]
+-                    + ((idx_tokens_conv + seqlen) * stride_conv_state_tok)[:, None]
++                    + (
++                        (idx_tokens_conv + seqlen + conv_state_token_offset)
++                        * stride_conv_state_tok
++                    )[:, None]
+                 )  # [BLOCK_M, BLOCK_N]
+                 mask = (
+                     (conv_states_input_coord < num_cache_lines)
+@@ -489,6 +517,7 @@
+     activation: str | None = "silu",
+     pad_slot_id: int = PAD_SLOT_ID,
+     null_block_id: int = NULL_BLOCK_ID,
++    num_accepted_tokens: torch.Tensor | None = None,
+     block_idx_first_scheduled_token: torch.Tensor | None = None,
+     block_idx_last_scheduled_token: torch.Tensor | None = None,
+     initial_state_idx: torch.Tensor | None = None,
+@@ -576,6 +605,8 @@
+     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
+     dim, cu_seqlen = x.shape
+     _, width = weight.shape
++    max_accepted_tokens = conv_states.size(2) - (width - 1) + 1
++    assert max_accepted_tokens >= 1
+     state_len = width - 1
+     np2_statelen = triton.next_power_of_2(state_len)
+ 
+@@ -724,6 +755,7 @@
+         block_idx_last_scheduled_token,
+         initial_state_idx,
+         num_computed_tokens,
++        num_accepted_tokens,
+         out,
+         # Matrix dimensions
+         dim,
+@@ -748,6 +780,8 @@
+         KERNEL_WIDTH=width,
+         SILU_ACTIVATION=activation in ["silu", "swish"],
+         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
++        IS_SPEC_DECODING=num_accepted_tokens is not None,
++        MAX_ACCEPTED_TOKENS=max_accepted_tokens,
+         HAS_NULL_BLOCK=null_block_id is not None,
+         NP2_STATELEN=np2_statelen,
+         # launch_cooperative_grid=True
+@@ -800,6 +834,7 @@
+     IS_VARLEN: tl.constexpr,
+     IS_APC_ENABLED: tl.constexpr,
+     IS_SPEC_DECODING: tl.constexpr,
++    MAX_ACCEPTED_TOKENS: tl.constexpr,
+     NP2_STATELEN: tl.constexpr,
+     HAS_NULL_BLOCK: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -872,7 +907,7 @@
+         # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
+         # - and so on.
+         num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
+-        if (num_accepted < 1) | (num_accepted > seqlen):
++        if (num_accepted < 1) | (num_accepted > MAX_ACCEPTED_TOKENS):
+             zero = tl.zeros((BLOCK_N,), dtype=tl.float32)
+             for idx_token in tl.range(seqlen):
+                 o_ptrs = (
+@@ -1194,8 +1229,10 @@
+         dim = x.size(1)
+         seqlen = max_query_len
+     _, width = weight.shape
+-    # conv_state: (..., dim, state_len), where state_len >= width - 1
++    # Physical state capacity can include speculative slots beyond width - 1.
+     num_cache_lines, _, state_len = conv_state.size()
++    max_accepted_tokens = state_len - (width - 1) + 1
++    assert max_accepted_tokens >= 1
+ 
+     if validate_data:
+         assert dim == weight.size(0)
+@@ -1281,6 +1318,7 @@
+         IS_VARLEN=query_start_loc is not None,
+         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
+         IS_SPEC_DECODING=num_accepted_tokens is not None,
++        MAX_ACCEPTED_TOKENS=max_accepted_tokens,
+         NP2_STATELEN=np2_statelen,
+         HAS_NULL_BLOCK=null_block_id is not None,
+         BLOCK_N=256,
+diff --git a/v1/attention/backends/gdn_attn.py b/v1/attention/backends/gdn_attn.py
+index 27df94d..b8a7eea 100644
+--- a/v1/attention/backends/gdn_attn.py
++++ b/v1/attention/backends/gdn_attn.py
+@@ -65,6 +65,11 @@
+ 
+     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
+ 
++    # Source blocks and accepted counts used to recover recurrent state on the
++    # first non-spec step after speculative decoding.
++    spec_decode_src_indices: torch.Tensor | None = None
++    non_spec_num_accepted: torch.Tensor | None = None
++
+     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
+     chunk_indices: torch.Tensor | None = None
+     chunk_offsets: torch.Tensor | None = None
+@@ -247,6 +252,9 @@
+                     spec_sequence_masks_cpu, device=query_start_loc.device
+                 )
+ 
++        spec_decode_src_indices = None
++        non_spec_num_accepted = None
++
+         if spec_sequence_masks is None:
+             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                 split_decodes_and_prefills(m, decode_threshold=1)
+@@ -259,7 +267,44 @@
+             spec_query_start_loc = None
+             non_spec_query_start_loc = query_start_loc
+             non_spec_query_start_loc_cpu = query_start_loc_cpu
+-            num_accepted_tokens = None
++            if (
++                self.use_spec_decode
++                and num_accepted_tokens is not None
++                and num_decodes > 0
++            ):
++                assert non_spec_state_indices_tensor is not None
++                decode_num_accepted = num_accepted_tokens[:num_decodes]
++                max_accepted = self.num_spec + 1
++                valid = (decode_num_accepted >= 1) & (
++                    decode_num_accepted <= max_accepted
++                )
++                col_indices = (decode_num_accepted - 1).clamp(
++                    min=0, max=self.num_spec
++                )
++                recovered = block_table_tensor[
++                    torch.arange(num_decodes, device=block_table_tensor.device),
++                    col_indices,
++                ]
++                # Invalid counts must not turn into an unrelated SSM source.
++                spec_decode_src_indices = torch.where(
++                    valid,
++                    recovered,
++                    non_spec_state_indices_tensor[:num_decodes],
++                )
++                num_accepted_tokens = decode_num_accepted
++                if num_prefills > 0:
++                    num_accepted_tokens = torch.cat(
++                        [
++                            num_accepted_tokens,
++                            torch.ones(
++                                num_prefills,
++                                dtype=num_accepted_tokens.dtype,
++                                device=num_accepted_tokens.device,
++                            ),
++                        ]
++                    )
++            else:
++                num_accepted_tokens = None
+         else:
+             query_lens = query_start_loc[1:] - query_start_loc[:-1]
+             assert spec_sequence_masks_cpu is not None
+@@ -362,6 +407,32 @@
+                     out=non_spec_query_start_loc_cpu[1:],
+                 )
+ 
++                # Recover the non-speccing partition of a heterogeneous batch.
++                # Build this before filtering num_accepted_tokens to spec rows.
++                assert num_accepted_tokens is not None
++                non_spec_mask_cpu = ~spec_sequence_masks_cpu
++                non_spec_num_accepted = num_accepted_tokens[
++                    non_spec_mask_cpu
++                ].clamp(min=1)
++                max_accepted = self.num_spec + 1
++                valid = non_spec_num_accepted <= max_accepted
++                col_indices = (non_spec_num_accepted - 1).clamp(
++                    min=0, max=self.num_spec
++                )
++                non_spec_block_rows = block_table_tensor[non_spec_mask_cpu]
++                recovered = non_spec_block_rows[
++                    torch.arange(
++                        non_spec_block_rows.size(0),
++                        device=block_table_tensor.device,
++                    ),
++                    col_indices,
++                ]
++                spec_decode_src_indices = torch.where(
++                    valid,
++                    recovered,
++                    non_spec_state_indices_tensor,
++                )
++
+             assert num_accepted_tokens is not None
+             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+ 
+@@ -494,6 +565,14 @@
+             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
+             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+ 
++            if num_accepted_tokens is not None:
++                num_accepted = num_accepted_tokens.size(0)
++                self.num_accepted_tokens[:num_accepted].copy_(
++                    num_accepted_tokens, non_blocking=True
++                )
++                num_accepted_tokens = self.num_accepted_tokens[:batch_size]
++                num_accepted_tokens[num_accepted:].fill_(1)
++
+         attn_metadata = GDNAttentionMetadata(
+             num_prefills=num_prefills,
+             num_prefill_tokens=num_prefill_tokens,
+@@ -516,6 +595,8 @@
+             spec_token_indx=spec_token_indx,
+             non_spec_token_indx=non_spec_token_indx,
+             num_accepted_tokens=num_accepted_tokens,
++            spec_decode_src_indices=spec_decode_src_indices,
++            non_spec_num_accepted=non_spec_num_accepted,
+             nums_dict=nums_dict,
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
