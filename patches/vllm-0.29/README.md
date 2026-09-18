@@ -46,8 +46,7 @@ change a hash. Fix the commit and re-export instead.
 ## The series
 
 `kind` uses the vocabulary of [PATCHES.md](../../PATCHES.md). Its `retires when`
-column is deliberately absent: for these patches that is not established, and a
-guess in that column would read like a commitment.
+column is not carried here; a guess in it would read like a commitment.
 
 | patch | kind | what | upstream |
 |---|---|---|---|
@@ -76,7 +75,7 @@ enter the torch.compile cache key: `VLLM_VISION_CPU_OFFLOAD_GB`,
 `VLLM_TRITON_FP8_MQ3D_TRACE` and `VLLM_TRITON_FP8_MQ3D_MIXED_TARGET`. Every
 feature here is off by default.
 
-## What is not here
+## Why the series is eighteen
 
 The recipe this series comes from carries four more patches that this directory
 does not, and the reason is structural rather than a matter of effort. They are
@@ -92,10 +91,6 @@ four patches ship on -- the prefix-cache admission filter, the per-tile paged
 addressing and the chunk-major V layout. None of them exercises anything in
 these eighteen. Carrying them would mean shipping tests for code this fork does
 not contain, which fails loudly at best and passes vacuously at worst.
-
-So the CPU-side evidence here is the two apply passes and `SHA256SUMS`, not a
-test suite. There is no GPU measurement behind any of this yet. The series
-applies to the tag it names and the hashes match; that is the whole claim.
 
 ## What the jump costs the 0.28.0 series
 
