@@ -29,9 +29,17 @@ git -C "$VLLM_SOURCE" rev-parse --is-inside-work-tree >/dev/null
 # and silently skips ("Skipped patch '...'") anything outside the subdirectory
 # it runs in -- so running it from the package directory checked nothing at all
 # and reported OK. Run from the repository root and name the prefix explicitly.
-GIT_ROOT=$(git -C "$VLLM_SOURCE" rev-parse --show-toplevel)
-PREFIX=${VLLM_SOURCE#"$GIT_ROOT"/}
-if [ "$PREFIX" = "$VLLM_SOURCE" ]; then PREFIX=.; fi
+#
+# The prefix comes from `rev-parse --show-prefix` rather than from subtracting
+# `--show-toplevel` out of the directory. Those two are formatted differently on
+# Windows (`C:/src/vllm` against `/c/src/vllm`), so the subtraction matches
+# nothing, the fallback leaves the prefix at `.`, and pass 2 then aborts on the
+# first patch with "No such file or directory" for every path in it. Linux CI
+# never saw it because both forms agree there.
+GIT_ROOT=$(cd -- "$(git -C "$VLLM_SOURCE" rev-parse --show-toplevel)" && pwd)
+PREFIX=$(git -C "$VLLM_SOURCE" rev-parse --show-prefix)
+PREFIX=${PREFIX%/}
+[ -n "$PREFIX" ] || PREFIX=.
 
 # DFlash2 is native in 0.28.0; the backport patch is kept for older pins.
 SKIP=(dflash2-backport.patch)
