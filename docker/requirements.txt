@@ -17,3 +17,10 @@ ninja==1.13.0
 # members are for HF-hosted --dataset-name values and the plotting subcommands,
 # and this repo's scripts use only `random` and `custom`.
 pandas==3.0.5
+# bench/quality_battery.py, bench/act_calib.py, drafter/collect_prompts.py and
+# prepare/build_draft_vocab.py all `import pyarrow.parquet`, and the datasets
+# they read ship as parquet. pandas 3.0.5 does not pull it in, so a locally
+# built image raises ModuleNotFoundError on the quality battery that the field
+# test protocol in the README asks for. The published image has it; only a
+# `docker compose build` shows the gap.
+pyarrow==21.0.0
