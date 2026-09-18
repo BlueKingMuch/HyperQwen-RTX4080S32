@@ -1,0 +1,88 @@
+gguf-rco step 6g: a mixed-type merged layer keeps its shards as their own
+contiguous tensors instead of views of a zero-padded concatenation (the
+compiled graph materialised every strided view before the custom op: 37
+copies of about 45 MB per decode step, 2.4 ms; the prefill path copied each
+shard per call). Same-type merged layers keep the one concatenated tensor and
+the single call. Applies after 0022, 0023, 0024 and 0027.
+
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -210,20 +210,39 @@
+             dtype = next(iter(dtype))
+             padded_side = max(x.size(1) for x in data_container)
+             concat_side = sum(x.size(0) for x in data_container)
+-            padded_data = torch.zeros(
+-                (concat_side, padded_side), dtype=dtype, device=weight.device
+-            )
+             shard_offset_map = dict[str, tuple[int, int, int]]()
+             ordered_shard_ids = _gguf_ordered_shard_ids(shard_id)
++            # gguf-rco step 6g: shards of different types are kept as their own
++            # contiguous tensors (the matmul runs per shard anyway); the padded
++            # concatenation only for shards of one type, where it has no padding
++            # and serves one call
++            fallback_wtype = layer.weight_type.weight_type
++            shard_types = {
++                layer.weight_type.shard_weight_type.get(idx, fallback_wtype)
++                for idx in ordered_shard_ids
++            }
++            mixed = len(shard_types) > 1
++            if mixed:
++                padded_data = torch.empty(0, dtype=dtype, device=weight.device)
++                gguf_shards = {}
++            else:
++                padded_data = torch.zeros(
++                    (concat_side, padded_side), dtype=dtype, device=weight.device
++                )
+             current_offset = 0
+             for idx in ordered_shard_ids:
+                 id_in_container = shard_id_map[idx]
+                 start = current_offset
+                 end = start + data_container[id_in_container].size(0)
+                 size = data_container[id_in_container].size(1)
+-                padded_data[start:end, :size] = data_container[id_in_container]
++                if mixed:
++                    gguf_shards[idx] = data_container[id_in_container].contiguous()
++                else:
++                    padded_data[start:end, :size] = data_container[id_in_container]
+                 shard_offset_map[idx] = (start, end, size)
+                 current_offset = end
++            if mixed:
++                layer.gguf_shards = gguf_shards
+             padded_param = GGUFWeightParameter(
+                 data=padded_data,
+                 weight_loader=weight.weight_loader,
+@@ -270,20 +289,24 @@
+                     out.add_(bias)
+                 return out
+             result = []
++            gguf_shards = getattr(layer, "gguf_shards", None)
+             for idx in shard_id:
+-                start, end, offset = layer.weight.shard_offset_map[idx]
+                 weight_type = layer.weight_type.shard_weight_type.get(
+                     idx, fallback_wtype
+                 )
+-                shard = weight[start:end, :offset]
+-                if not (
+-                    x.shape[0] <= 2 * GLUON_MAX_ROWS
+-                    and weight_type in GLUON_TYPES
+-                    and x.dtype == torch.bfloat16
+-                ):
+-                    # the CUDA paths need contiguous rows; the Gluon kernel
+-                    # takes the view (gguf-rco step 6d)
+-                    shard = shard.contiguous()
++                if gguf_shards is not None:
++                    # gguf-rco step 6g: the shard's own contiguous tensor - no
++                    # view for the compiled graph to materialise, no copy
++                    shard = gguf_shards[idx]
++                else:
++                    start, end, offset = layer.weight.shard_offset_map[idx]
++                    shard = weight[start:end, :offset]
++                    if not (
++                        x.shape[0] <= 2 * GLUON_MAX_ROWS
++                        and weight_type in GLUON_TYPES
++                        and x.dtype == torch.bfloat16
++                    ):
++                        shard = shard.contiguous()
+                 result.append(fused_mul_mat_gguf_op(x, shard, weight_type))
+             out = torch.cat(result, axis=1)
+         else:

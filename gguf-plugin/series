@@ -1,0 +1,25 @@
+# Apply order for the GGUF plugin patches, one basename per line.
+#
+# install.sh applies them in THIS order onto the extracted archive of the pinned
+# upstream commit, with `patch -p1` from the source root. Order is a hard
+# requirement: gguf-iq3s-tiles-only narrows what gguf-iq3s-tiles adds, and
+# gguf-tiles-all-types and gguf-tiles-grouped build on both.
+#
+# The Gluon modules in gluon/ are copied into vllm_gguf_plugin/triton/gluon/
+# immediately before gguf-gluon-dispatch.patch, which is the patch that wires
+# them into the plugin's matmul. They are files, not a patch, so they are not
+# listed here; install.sh does the copy at that point.
+#
+#   - a new independent patch goes on the last line
+#   - a patch that must apply before an existing one is listed before it
+
+gguf-loader-draft-bridge.patch
+gguf-mmvq-batched.patch
+gguf-gluon-dispatch.patch
+gguf-iq3s-grid-top-magnitude.patch
+gguf-prefill-dispatch.patch
+gguf-shard-tensors.patch
+gguf-iq3s-tiles.patch
+gguf-iq3s-tiles-only.patch
+gguf-tiles-all-types.patch
+gguf-tiles-grouped.patch

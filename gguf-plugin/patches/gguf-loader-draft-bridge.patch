@@ -1,0 +1,111 @@
+--- a/vllm_gguf_plugin/loader.py
++++ b/vllm_gguf_plugin/loader.py
+@@ -22,6 +22,7 @@
+ from .gguf_utils import (
+     detect_gguf_multimodal,
+     get_remote_gguf_repo_id,
++    is_gguf,
+     resolve_explicit_mm_proj,
+ )
+ from .quantization import GGUFConfig, recursive_replace_vocab_modules
+@@ -80,6 +81,23 @@
+     return tuple(sorted(modules))
+ 
+ 
++def _is_gguf_model(model_config: ModelConfig) -> bool:
++    """gguf-rco draft bridge: does this model config point at GGUF weights?
++
++    The engine-args patch sets ``load_format = gguf`` for the whole engine
++    when the target is a GGUF reference, so every model the engine loads
++    through ``get_model_loader`` arrives here - including a speculative
++    draft shipped as safetensors (compressed-tensors) in a plain directory.
++    Such a model is handed to vLLM's default loader with its own
++    quantization config; anything else stays on the GGUF path.
++    """
++    reference = model_config.model_weights or model_config.model
++    if not reference:
++        return True
++    reference = str(reference)
++    return reference.endswith(".gguf") or is_gguf(reference)
++
++
+ class GGUFModelLoader(BaseModelLoader):
+     """
+     Model loader that can load GGUF files. This is useful for loading models
+@@ -193,16 +211,59 @@
+         )
+         return adapter.transform_weights(weights, model_config)
+ 
++    def _default_loader(self) -> BaseModelLoader:
++        """The default loader for a non-GGUF model (gguf-rco draft bridge)."""
++        from dataclasses import replace
++
++        from vllm.model_executor.model_loader.default_loader import (
++            DefaultModelLoader,
++        )
++
++        load_config = replace(
++            self.load_config,
++            load_format="auto",
++            model_loader_extra_config={},
++        )
++        return DefaultModelLoader(load_config)
++
+     def download_model(self, model_config: ModelConfig) -> None:
++        if not _is_gguf_model(model_config):
++            self._default_loader().download_model(model_config)
++            return
+         self._prepare_model_files(model_config)
+ 
+     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
++        if not _is_gguf_model(model_config):
++            self._default_loader().load_weights(model, model_config)
++            return
+         adapter, plan = self._prepare_adapter(model_config)
+         model.load_weights(self._iter_weights(adapter, plan, model_config))
+ 
+     def load_model(
+         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
+     ) -> nn.Module:
++        if not _is_gguf_model(model_config):
++            # gguf-rco draft bridge: the draft's VllmConfig is a copy of the
++            # target's and carries the target's GGUF quant config; give the
++            # model its own, derived from its own checkpoint, and load it
++            # with the default loader.
++            import copy
++
++            own_config = copy.copy(vllm_config)
++            own_config.quant_config = VllmConfig.get_quantization_config(
++                model_config, self.load_config
++            )
++            logger.info(
++                "gguf-rco draft bridge: %s is not GGUF, loading it with the "
++                "default loader and quantization %s",
++                model_config.model_weights or model_config.model,
++                type(own_config.quant_config).__name__
++                if own_config.quant_config is not None
++                else None,
++            )
++            return self._default_loader().load_model(
++                vllm_config=own_config, model_config=model_config, prefix=prefix
++            )
+         device_config = vllm_config.device_config
+         adapter, plan = self._prepare_adapter(model_config)
+         logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
+--- a/vllm_gguf_plugin/config_parser.py
++++ b/vllm_gguf_plugin/config_parser.py
+@@ -40,6 +40,14 @@
+             config_dict["norm_topk_prob"] = True
+             config.update({"norm_topk_prob": True})
+ 
++        if not is_gguf(original_model) and config_dict.get("architectures"):
++            # gguf-rco draft bridge (config): the engine-args patch sets
++            # config_format = gguf engine-wide, and a speculative draft's
++            # ModelConfig inherits it, so a plain HF checkpoint (the
++            # safetensors DFlash2 draft) arrives here too. It declares its
++            # own architectures; keep them instead of the transformers
++            # causal-LM name for its model_type, which vLLM may not know.
++            return config_dict, config
+         architecture = get_adapter_architecture(config)
+         if (
+             architecture is None

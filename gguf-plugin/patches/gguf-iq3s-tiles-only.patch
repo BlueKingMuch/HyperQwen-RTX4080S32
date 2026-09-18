@@ -1,0 +1,75 @@
+gguf-rco step 6h, second part (0037): the IQ3_S tensors held tile-major only.
+After the repack the raw rows are freed; every call of such a tensor goes
+through the tiles op - the tile kernel up to 32 rows, the tile dequantiser and
+cuBLAS above (the prefill). Applies after 0036.
+
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -223,33 +223,38 @@
+         self._create_iq3s_tiles(layer)
+ 
+     def _create_iq3s_tiles(self, layer: torch.nn.Module) -> None:
+-        """gguf-rco step 6h (0036): every IQ3_S shard (or the whole weight of a
+-        single-type layer) repacked tile-major once for the decode kernel; the
+-        raw rows stay for the prefill's dequantiser (a measurement build: the
+-        IQ3_S bytes are held twice, +1.8 % on the tiles)."""
++        """gguf-rco step 6h (0036 / 0037): every IQ3_S shard (or the whole weight
++        of a single-type layer) repacked tile-major once; every call of that
++        tensor - the decode kernel up to 32 rows, the tile dequantiser and cuBLAS
++        above - runs on the tiles, so the raw rows are freed (0037; the 0036
++        measurement build held them twice)."""
+         tiles = {}
++        rows = {}
+         fallback_wtype = layer.weight_type.weight_type
+         gguf_shards = getattr(layer, "gguf_shards", None)
+         if gguf_shards is not None:
+             for idx, shard in gguf_shards.items():
+                 if layer.weight_type.shard_weight_type.get(idx, fallback_wtype) == GGML_TYPE_IQ3_S:
+                     tiles[idx] = repack_iq3s_tiles(shard, shard.shape[0])
++                    rows[idx] = shard.shape[0]
++            for idx in tiles:
++                gguf_shards[idx] = torch.empty(0, dtype=torch.uint8, device=tiles[idx].device)
+         elif fallback_wtype == GGML_TYPE_IQ3_S and layer.weight.data.numel() > 0:
+             w = layer.weight.data
+             tiles["__all__"] = repack_iq3s_tiles(w, w.shape[0])
++            rows["__all__"] = w.shape[0]
++            layer.weight.data = torch.empty(0, dtype=torch.uint8, device=w.device)
+         if tiles:
+             layer.gguf_tiles = tiles
++            layer.gguf_tiles_rows = rows
++            torch.cuda.empty_cache()
+ 
+     def _mul_mat_whole(self, layer: torch.nn.Module, x: torch.Tensor, weight: torch.Tensor, weight_type: int) -> torch.Tensor:
+         # gguf-rco step 6h: a whole-tensor IQ3_S call on its tiles at decode rows
+         tiles = getattr(layer, "gguf_tiles", None)
+-        if (
+-            tiles is not None
+-            and "__all__" in tiles
+-            and x.shape[0] <= 2 * GLUON_MAX_ROWS
+-            and x.dtype == torch.bfloat16
+-        ):
+-            return fused_mul_mat_gguf_iq3s_tiles(x, tiles["__all__"], weight.shape[0])
++        if tiles is not None and "__all__" in tiles:
++            # 0037: every row count on the tiles (the raw rows are gone)
++            return fused_mul_mat_gguf_iq3s_tiles(x, tiles["__all__"], layer.gguf_tiles_rows["__all__"])
+         return fused_mul_mat_gguf(x, weight, weight_type)
+ 
+     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
+@@ -373,14 +378,9 @@
+                         and x.dtype == torch.bfloat16
+                     ):
+                         shard = shard.contiguous()
+-                if (
+-                    gguf_tiles is not None
+-                    and idx in gguf_tiles
+-                    and x.shape[0] <= 2 * GLUON_MAX_ROWS
+-                    and x.dtype == torch.bfloat16
+-                ):
+-                    # gguf-rco step 6h: the IQ3_S shard's decode on its tiles
+-                    result.append(fused_mul_mat_gguf_iq3s_tiles(x, gguf_tiles[idx], shard.shape[0]))
++                if gguf_tiles is not None and idx in gguf_tiles:
++                    # gguf-rco step 6h (0037): the IQ3_S shard at every row count on its tiles
++                    result.append(fused_mul_mat_gguf_iq3s_tiles(x, gguf_tiles[idx], layer.gguf_tiles_rows[idx]))
+                 else:
+                     result.append(fused_mul_mat_gguf_op(x, shard, weight_type))
+             out = torch.cat(result, axis=1)

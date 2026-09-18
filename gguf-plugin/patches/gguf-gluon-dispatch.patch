@@ -1,0 +1,54 @@
+gguf-rco step 6d: the Gluon decode kernels dispatched from _fused_mul_mat_gguf
+for up to 16 rows of bf16 activations and the GGUF types that have one
+(vllm_gguf_plugin/triton/gluon/); a merged layer's shard is passed as the
+strided view on that path instead of a per-step .contiguous() copy.
+Applies after 0022 and 0023.
+
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -12,6 +12,7 @@
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ from .. import ops
++from ..triton.gluon.interface import GLUON_MAX_ROWS, GLUON_TYPES, gluon_mul_mat
+ from .layout import GGUFLinearLayout
+ from .params import (
+     GGUFUninitializedWeightParameter,
+@@ -43,6 +44,15 @@
+         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+     if weight_type in UNQUANTIZED_TYPES:
+         return x @ weight.T
++    # gguf-rco step 6d: the Gluon tensor-core decode kernels read a row's
++    # weights once per step for up to 16 vectors, on the rows as they are
++    # (a merged layer's strided shard view included)
++    if (
++        x.shape[0] <= GLUON_MAX_ROWS
++        and weight_type in GLUON_TYPES
++        and x.dtype == torch.bfloat16
++    ):
++        return gluon_mul_mat(x, weight, weight_type, weight.shape[0])
+     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
+         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
+     elif weight_type in MMQ_QUANT_TYPES:
+@@ -249,11 +259,16 @@
+                 weight_type = layer.weight_type.shard_weight_type.get(
+                     idx, fallback_wtype
+                 )
+-                result.append(
+-                    fused_mul_mat_gguf_op(
+-                        x, weight[start:end, :offset].contiguous(), weight_type
+-                    )
+-                )
++                shard = weight[start:end, :offset]
++                if not (
++                    x.shape[0] <= GLUON_MAX_ROWS
++                    and weight_type in GLUON_TYPES
++                    and x.dtype == torch.bfloat16
++                ):
++                    # the CUDA paths need contiguous rows; the Gluon kernel
++                    # takes the view (gguf-rco step 6d)
++                    shard = shard.contiguous()
++                result.append(fused_mul_mat_gguf_op(x, shard, weight_type))
+             out = torch.cat(result, axis=1)
+         else:
+             weight = layer.weight
