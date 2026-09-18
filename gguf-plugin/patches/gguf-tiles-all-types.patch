@@ -1,0 +1,154 @@
+gguf-rco step 6h, third part (0038): every int8 type tile-major.
+The loader repacks every shard of a type with a tile-major decode kernel
+(IQ3_S, IQ4_XS, Q4_K, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S) and frees the raw
+rows; every call of such a tensor goes through the tiles op with the type as
+its argument - the type's tile kernel up to 32 rows, the dequantised tiles
+(IQ3_S by its tile dequantiser, the others un-repacked for the CUDA one) and
+cuBLAS above. Applies after 0037.
+
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -16,8 +16,11 @@
+     GLUON_MAX_ROWS,
+     GLUON_TYPES,
+     gluon_mul_mat,
++    GLUON_TILE_TYPES,
+     gluon_mul_mat_iq3s_tiles,
++    gluon_mul_mat_tiles,
+     repack_iq3s_tiles,
++    repack_tiles,
+ )
+ from .layout import GGUFLinearLayout
+ from .params import (
+@@ -134,6 +137,35 @@
+ except AttributeError as error:
+     raise error
+ 
++
++def _fused_mul_mat_gguf_tiles(
++    x: torch.Tensor, tiles: torch.Tensor, n_out: int, weight_type: int
++) -> torch.Tensor:
++    # gguf-rco step 6h (0038): every int8 type's decode on its tile-major
++    # repack with 16-byte copies (the lab measured -13 to -45 % per launch
++    # against the row forms at base clock); the row-count dispatch lives in
++    # the op (docs/kernel-lessons.md 7b) - the tile kernel up to 32 rows, the
++    # prefill above un-repacks the tiles for the CUDA dequantiser and cuBLAS
++    # (IQ3_S on its own tile dequantiser, 0037)
++    return gluon_mul_mat_tiles(x, tiles, n_out, weight_type)
++
++
++def _fused_mul_mat_gguf_tiles_fake(
++    x: torch.Tensor, tiles: torch.Tensor, n_out: int, weight_type: int
++) -> torch.Tensor:
++    return torch.empty(x.shape[0], n_out, dtype=x.dtype, device=x.device)
++
++
++try:
++    direct_register_custom_op(
++        op_name="_fused_mul_mat_gguf_tiles",
++        op_func=_fused_mul_mat_gguf_tiles,
++        fake_impl=_fused_mul_mat_gguf_tiles_fake,
++    )
++    fused_mul_mat_gguf_tiles = torch.ops.vllm._fused_mul_mat_gguf_tiles
++except AttributeError as error:
++    raise error
++
+ GGML_TYPE_IQ3_S = 21
+ 
+ 
+@@ -220,41 +252,67 @@
+                 f"Unsupported GGUF quantization type {weight_type} in layer {layer}."
+             )
+         self._create_padded_weight_param(layer)
+-        self._create_iq3s_tiles(layer)
+-
+-    def _create_iq3s_tiles(self, layer: torch.nn.Module) -> None:
+-        """gguf-rco step 6h (0036 / 0037): every IQ3_S shard (or the whole weight
+-        of a single-type layer) repacked tile-major once; every call of that
+-        tensor - the decode kernel up to 32 rows, the tile dequantiser and cuBLAS
+-        above - runs on the tiles, so the raw rows are freed (0037; the 0036
+-        measurement build held them twice)."""
++        self._create_tiles(layer)
++
++    def _create_tiles(self, layer: torch.nn.Module) -> None:
++        """gguf-rco step 6h (0036 / 0037 / 0038): every shard (or the whole weight
++        of a layer whose shards share one type) of a type with a tile-major
++        decode kernel - every int8 type - is repacked tile-major once; every
++        call of that tensor - the decode kernel up to 32 rows, the dequantised
++        tiles and cuBLAS above - runs on the tiles, so the raw rows are freed.
++        Only weights consumed through apply: the token embedding stays raw."""
++        from vllm.model_executor.layers.vocab_parallel_embedding import (
++            ParallelLMHead,
++            VocabParallelEmbedding,
++        )
++
++        if isinstance(layer, VocabParallelEmbedding) and not isinstance(layer, ParallelLMHead):
++            # the token embedding's rows are gathered by _apply_gguf_embedding,
++            # never multiplied through apply: they stay raw (the first 0038 build
++            # tiled the IQ2_S embedding and the lookup found an empty weight)
++            return
+         tiles = {}
+         rows = {}
++        types = {}
+         fallback_wtype = layer.weight_type.weight_type
+         gguf_shards = getattr(layer, "gguf_shards", None)
+         if gguf_shards is not None:
+             for idx, shard in gguf_shards.items():
+-                if layer.weight_type.shard_weight_type.get(idx, fallback_wtype) == GGML_TYPE_IQ3_S:
+-                    tiles[idx] = repack_iq3s_tiles(shard, shard.shape[0])
++                wtype = layer.weight_type.shard_weight_type.get(idx, fallback_wtype)
++                if wtype in GLUON_TILE_TYPES and shard.numel() > 0:
++                    tiles[idx] = repack_tiles(shard, shard.shape[0], wtype)
+                     rows[idx] = shard.shape[0]
++                    types[idx] = wtype
+             for idx in tiles:
+                 gguf_shards[idx] = torch.empty(0, dtype=torch.uint8, device=tiles[idx].device)
+-        elif fallback_wtype == GGML_TYPE_IQ3_S and layer.weight.data.numel() > 0:
+-            w = layer.weight.data
+-            tiles["__all__"] = repack_iq3s_tiles(w, w.shape[0])
+-            rows["__all__"] = w.shape[0]
+-            layer.weight.data = torch.empty(0, dtype=torch.uint8, device=w.device)
++        elif layer.weight.data.numel() > 0:
++            # the whole tensor: a single-type layer, or a merged layer whose
++            # shards share one type (apply calls those whole, by that type)
++            shard_id = getattr(layer.weight, "shard_id", None)
++            wtypes = (
++                {layer.weight_type.shard_weight_type.get(idx, fallback_wtype) for idx in shard_id}
++                if shard_id
++                else {fallback_wtype}
++            )
++            wtype = next(iter(wtypes))
++            if len(wtypes) == 1 and wtype in GLUON_TILE_TYPES:
++                w = layer.weight.data
++                tiles["__all__"] = repack_tiles(w, w.shape[0], wtype)
++                rows["__all__"] = w.shape[0]
++                types["__all__"] = wtype
++                layer.weight.data = torch.empty(0, dtype=torch.uint8, device=w.device)
+         if tiles:
+             layer.gguf_tiles = tiles
+             layer.gguf_tiles_rows = rows
++            layer.gguf_tiles_types = types
+             torch.cuda.empty_cache()
+ 
+     def _mul_mat_whole(self, layer: torch.nn.Module, x: torch.Tensor, weight: torch.Tensor, weight_type: int) -> torch.Tensor:
+-        # gguf-rco step 6h: a whole-tensor IQ3_S call on its tiles at decode rows
++        # gguf-rco step 6h (0038): a whole tensor of a tile type on its tiles at every row count
+         tiles = getattr(layer, "gguf_tiles", None)
+         if tiles is not None and "__all__" in tiles:
+             # 0037: every row count on the tiles (the raw rows are gone)
+-            return fused_mul_mat_gguf_iq3s_tiles(x, tiles["__all__"], layer.gguf_tiles_rows["__all__"])
++            return fused_mul_mat_gguf_tiles(x, tiles["__all__"], layer.gguf_tiles_rows["__all__"], layer.gguf_tiles_types["__all__"])
+         return fused_mul_mat_gguf(x, weight, weight_type)
+ 
+     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
+@@ -379,8 +437,8 @@
+                     ):
+                         shard = shard.contiguous()
+                 if gguf_tiles is not None and idx in gguf_tiles:
+-                    # gguf-rco step 6h (0037): the IQ3_S shard at every row count on its tiles
+-                    result.append(fused_mul_mat_gguf_iq3s_tiles(x, gguf_tiles[idx], layer.gguf_tiles_rows[idx]))
++                    # gguf-rco step 6h (0038): the shard of a tile type at every row count on its tiles
++                    result.append(fused_mul_mat_gguf_tiles(x, gguf_tiles[idx], layer.gguf_tiles_rows[idx], layer.gguf_tiles_types[idx]))
+                 else:
+                     result.append(fused_mul_mat_gguf_op(x, shard, weight_type))
+             out = torch.cat(result, axis=1)

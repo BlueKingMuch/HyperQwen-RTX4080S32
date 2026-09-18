@@ -1,0 +1,136 @@
+gguf-rco step 6h (0036): the IQ3_S decode on a tile-major repack with 16-byte
+copies. After loading, every IQ3_S shard (or single-type weight) is repacked
+once into tiles of 64 rows x 112 bytes per (64-row tile, k-block), the fields
+word-aligned, and the decode calls of that tensor go through a custom op onto
+the tile kernel; the raw rows stay for the prefill's dequantiser (a measurement
+build: the IQ3_S bytes are held twice). Applies after 0022-0029.
+
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -12,7 +12,13 @@
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ from .. import ops
+-from ..triton.gluon.interface import GLUON_MAX_ROWS, GLUON_TYPES, gluon_mul_mat
++from ..triton.gluon.interface import (
++    GLUON_MAX_ROWS,
++    GLUON_TYPES,
++    gluon_mul_mat,
++    gluon_mul_mat_iq3s_tiles,
++    repack_iq3s_tiles,
++)
+ from .layout import GGUFLinearLayout
+ from .params import (
+     GGUFUninitializedWeightParameter,
+@@ -103,6 +109,34 @@
+     raise error
+ 
+ 
++def _fused_mul_mat_gguf_iq3s_tiles(
++    x: torch.Tensor, tiles: torch.Tensor, n_out: int
++) -> torch.Tensor:
++    # gguf-rco step 6h (0036): the IQ3_S decode on the tile-major repack with
++    # 16-byte copies (the lab measured 1.19-1.48x per launch against the
++    # row form); the prefill rows stay on the raw layout and its dequantiser
++    return gluon_mul_mat_iq3s_tiles(x, tiles, n_out)
++
++
++def _fused_mul_mat_gguf_iq3s_tiles_fake(
++    x: torch.Tensor, tiles: torch.Tensor, n_out: int
++) -> torch.Tensor:
++    return torch.empty(x.shape[0], n_out, dtype=x.dtype, device=x.device)
++
++
++try:
++    direct_register_custom_op(
++        op_name="_fused_mul_mat_gguf_iq3s_tiles",
++        op_func=_fused_mul_mat_gguf_iq3s_tiles,
++        fake_impl=_fused_mul_mat_gguf_iq3s_tiles_fake,
++    )
++    fused_mul_mat_gguf_iq3s_tiles = torch.ops.vllm._fused_mul_mat_gguf_iq3s_tiles
++except AttributeError as error:
++    raise error
++
++GGML_TYPE_IQ3_S = 21
++
++
+ @register_weight_loader_v2_supported_method
+ class GGUFLinearMethod(LinearMethodBase):
+     """Linear method for GGUF."""
+@@ -186,6 +220,37 @@
+                 f"Unsupported GGUF quantization type {weight_type} in layer {layer}."
+             )
+         self._create_padded_weight_param(layer)
++        self._create_iq3s_tiles(layer)
++
++    def _create_iq3s_tiles(self, layer: torch.nn.Module) -> None:
++        """gguf-rco step 6h (0036): every IQ3_S shard (or the whole weight of a
++        single-type layer) repacked tile-major once for the decode kernel; the
++        raw rows stay for the prefill's dequantiser (a measurement build: the
++        IQ3_S bytes are held twice, +1.8 % on the tiles)."""
++        tiles = {}
++        fallback_wtype = layer.weight_type.weight_type
++        gguf_shards = getattr(layer, "gguf_shards", None)
++        if gguf_shards is not None:
++            for idx, shard in gguf_shards.items():
++                if layer.weight_type.shard_weight_type.get(idx, fallback_wtype) == GGML_TYPE_IQ3_S:
++                    tiles[idx] = repack_iq3s_tiles(shard, shard.shape[0])
++        elif fallback_wtype == GGML_TYPE_IQ3_S and layer.weight.data.numel() > 0:
++            w = layer.weight.data
++            tiles["__all__"] = repack_iq3s_tiles(w, w.shape[0])
++        if tiles:
++            layer.gguf_tiles = tiles
++
++    def _mul_mat_whole(self, layer: torch.nn.Module, x: torch.Tensor, weight: torch.Tensor, weight_type: int) -> torch.Tensor:
++        # gguf-rco step 6h: a whole-tensor IQ3_S call on its tiles at decode rows
++        tiles = getattr(layer, "gguf_tiles", None)
++        if (
++            tiles is not None
++            and "__all__" in tiles
++            and x.shape[0] <= 2 * GLUON_MAX_ROWS
++            and x.dtype == torch.bfloat16
++        ):
++            return fused_mul_mat_gguf_iq3s_tiles(x, tiles["__all__"], weight.shape[0])
++        return fused_mul_mat_gguf(x, weight, weight_type)
+ 
+     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
+         self._materialize_weight(layer)
+@@ -284,12 +349,13 @@
+                 for idx in shard_id
+             ]
+             if len(set(shard_weight_types)) == 1:
+-                out = fused_mul_mat_gguf_op(x, weight, shard_weight_types[0])
++                out = self._mul_mat_whole(layer, x, weight, shard_weight_types[0])
+                 if bias is not None:
+                     out.add_(bias)
+                 return out
+             result = []
+             gguf_shards = getattr(layer, "gguf_shards", None)
++            gguf_tiles = getattr(layer, "gguf_tiles", None)
+             for idx in shard_id:
+                 weight_type = layer.weight_type.shard_weight_type.get(
+                     idx, fallback_wtype
+@@ -307,12 +373,21 @@
+                         and x.dtype == torch.bfloat16
+                     ):
+                         shard = shard.contiguous()
+-                result.append(fused_mul_mat_gguf_op(x, shard, weight_type))
++                if (
++                    gguf_tiles is not None
++                    and idx in gguf_tiles
++                    and x.shape[0] <= 2 * GLUON_MAX_ROWS
++                    and x.dtype == torch.bfloat16
++                ):
++                    # gguf-rco step 6h: the IQ3_S shard's decode on its tiles
++                    result.append(fused_mul_mat_gguf_iq3s_tiles(x, gguf_tiles[idx], shard.shape[0]))
++                else:
++                    result.append(fused_mul_mat_gguf_op(x, shard, weight_type))
+             out = torch.cat(result, axis=1)
+         else:
+             weight = layer.weight
+             weight_type = layer.weight_type.weight_type
+-            out = fused_mul_mat_gguf_op(x, weight, weight_type)
++            out = self._mul_mat_whole(layer, x, weight, weight_type)
+         if bias is not None:
+             out.add_(bias)
+         return out

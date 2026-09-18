@@ -1,0 +1,171 @@
+gguf-rco step 6h, fifth part (0042): one kernel, one op, one launch per layer.
+Every tile-type layer goes through the grouped kernel: at load the tile-type
+shards of a layer (a run of consecutive ones; the whole tensor of a
+single-type layer is a run of one) are packed into one buffer with the
+descriptor tables of the splits the launch can choose, the shards' tiles
+become views into it; apply calls one op for the run - the activations
+quantised once per 256 (the sixth form on every type), every tile writing
+its own output columns, the split-K partials summed in one fp32 kernel.
+A Q2_K or IQ1_M shard stays on the row path beside its group. Applies
+after 0038 (0040's op is superseded; its patch is not applied).
+
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -21,6 +21,8 @@
+     gluon_mul_mat_tiles,
+     repack_iq3s_tiles,
+     repack_tiles,
++    gluon_mul_mat_tiles_grouped,
++    prepare_grouped_layer,
+ )
+ from .layout import GGUFLinearLayout
+ from .params import (
+@@ -166,6 +168,53 @@
+ except AttributeError as error:
+     raise error
+ 
++
++def _fused_mul_mat_gguf_tiles_grouped(
++    x: torch.Tensor,
++    packed: torch.Tensor,
++    descs: list[torch.Tensor],
++    desc_splits: list[int],
++    tiles: list[torch.Tensor],
++    n_outs: list[int],
++    weight_types: list[int],
++    nb: int,
++    block_bytes: int,
++) -> torch.Tensor:
++    # gguf-rco step 6h (0042): one kernel, one op, one launch for a layer's
++    # run of tile-type shards (one or many): the tiles packed at load with
++    # the descriptor table (one row per CTA: tile offset, type, output
++    # column, valid rows, k-range, split), the type uniform per CTA selecting
++    # the compiled decode, the activations quantised once per 256 (the sixth
++    # form on every type), every tile writing its own output columns, the
++    # split-K partials summed in one fp32 kernel; the row-count dispatch
++    # inside the op (docs/kernel-lessons.md 7b)
++    return gluon_mul_mat_tiles_grouped(x, packed, descs, desc_splits, tiles, n_outs, weight_types, nb, block_bytes)
++
++
++def _fused_mul_mat_gguf_tiles_grouped_fake(
++    x: torch.Tensor,
++    packed: torch.Tensor,
++    descs: list[torch.Tensor],
++    desc_splits: list[int],
++    tiles: list[torch.Tensor],
++    n_outs: list[int],
++    weight_types: list[int],
++    nb: int,
++    block_bytes: int,
++) -> torch.Tensor:
++    return torch.empty(x.shape[0], sum(n_outs), dtype=x.dtype, device=x.device)
++
++
++try:
++    direct_register_custom_op(
++        op_name="_fused_mul_mat_gguf_tiles_grouped",
++        op_func=_fused_mul_mat_gguf_tiles_grouped,
++        fake_impl=_fused_mul_mat_gguf_tiles_grouped_fake,
++    )
++    fused_mul_mat_gguf_tiles_grouped = torch.ops.vllm._fused_mul_mat_gguf_tiles_grouped
++except AttributeError as error:
++    raise error
++
+ GGML_TYPE_IQ3_S = 21
+ 
+ 
+@@ -305,14 +354,51 @@
+             layer.gguf_tiles = tiles
+             layer.gguf_tiles_rows = rows
+             layer.gguf_tiles_types = types
++            self._create_groups(layer)
+             torch.cuda.empty_cache()
++
++    def _create_groups(self, layer: torch.nn.Module) -> None:
++        """gguf-rco step 6h (0042): the tile-type shards of a layer packed into
++        one buffer with the descriptor tables of the splits the launch can
++        choose - a run of consecutive tile-type shards (a Q2_K or IQ1_M shard
++        between them stays on the row path) or the whole tensor of a
++        single-type layer is one group: one op, one launch. The shards' tiles
++        become views into the packed buffer (the prefill path reads them
++        there); the separate tile tensors go."""
++        tiles, rows, types = layer.gguf_tiles, layer.gguf_tiles_rows, layer.gguf_tiles_types
++        if "__all__" in tiles:
++            runs = [["__all__"]]
++        else:
++            shard_id = list(layer.weight.shard_id)
++            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
++            runs, run = [], []
++            for idx in shard_id:
++                if idx in tiles:
++                    run.append(idx)
++                elif run:
++                    runs.append(run)
++                    run = []
++            if run:
++                runs.append(run)
++        groups = {}
++        for run in runs:
++            packed, views, descs, splits, nb, block_bytes = prepare_grouped_layer(
++                [tiles[i] for i in run], [rows[i] for i in run], [types[i] for i in run]
++            )
++            for i, v in zip(run, views):
++                tiles[i] = v
++            groups[run[0]] = (packed, descs, splits, list(run), nb, block_bytes)
++        layer.gguf_groups = groups
+ 
+     def _mul_mat_whole(self, layer: torch.nn.Module, x: torch.Tensor, weight: torch.Tensor, weight_type: int) -> torch.Tensor:
+         # gguf-rco step 6h (0038): a whole tensor of a tile type on its tiles at every row count
+         tiles = getattr(layer, "gguf_tiles", None)
+         if tiles is not None and "__all__" in tiles:
+-            # 0037: every row count on the tiles (the raw rows are gone)
+-            return fused_mul_mat_gguf_tiles(x, tiles["__all__"], layer.gguf_tiles_rows["__all__"], layer.gguf_tiles_types["__all__"])
++            # 0042: the whole tensor as a group of one - the grouped op at every row count
++            packed, descs, splits, run, nb, block_bytes = layer.gguf_groups["__all__"]
++            return fused_mul_mat_gguf_tiles_grouped(
++                x, packed, descs, splits, [tiles["__all__"]], [layer.gguf_tiles_rows["__all__"]], [layer.gguf_tiles_types["__all__"]], nb, block_bytes
++            )
+         return fused_mul_mat_gguf(x, weight, weight_type)
+ 
+     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
+@@ -419,7 +505,31 @@
+             result = []
+             gguf_shards = getattr(layer, "gguf_shards", None)
+             gguf_tiles = getattr(layer, "gguf_tiles", None)
++            gguf_groups = getattr(layer, "gguf_groups", None) or {}
++            grouped = set()
+             for idx in shard_id:
++                if idx in grouped:
++                    continue
++                if idx in gguf_groups:
++                    # gguf-rco step 6h (0042): the run of tile-type shards that starts here in one op - one
++                    # kernel, one launch over the packed tiles and the descriptor table, the activations
++                    # quantised once per 256, every tile writing its own output columns
++                    packed, descs, splits, run, nb, block_bytes = gguf_groups[idx]
++                    result.append(
++                        fused_mul_mat_gguf_tiles_grouped(
++                            x,
++                            packed,
++                            descs,
++                            splits,
++                            [gguf_tiles[i] for i in run],
++                            [layer.gguf_tiles_rows[i] for i in run],
++                            [layer.gguf_tiles_types[i] for i in run],
++                            nb,
++                            block_bytes,
++                        )
++                    )
++                    grouped.update(run)
++                    continue
+                 weight_type = layer.weight_type.shard_weight_type.get(
+                     idx, fallback_wtype
+                 )
+@@ -441,7 +551,7 @@
+                     result.append(fused_mul_mat_gguf_tiles(x, gguf_tiles[idx], layer.gguf_tiles_rows[idx], layer.gguf_tiles_types[idx]))
+                 else:
+                     result.append(fused_mul_mat_gguf_op(x, shard, weight_type))
+-            out = torch.cat(result, axis=1)
++            out = result[0] if len(result) == 1 else torch.cat(result, axis=1)
+         else:
+             weight = layer.weight
+             weight_type = layer.weight_type.weight_type

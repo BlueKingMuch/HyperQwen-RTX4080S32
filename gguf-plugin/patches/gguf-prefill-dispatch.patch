@@ -1,0 +1,72 @@
+gguf-rco step 6f: the dispatch from the profiles - prefill through dequantise +
+cuBLAS for every type (the plugin's MMQ measured 12 TFLOP/s on Q4_K / Q2_K,
+2.8 s of an 8.3 s chunk), the Gluon path up to 32 rows on row halves, the
+batched MMVQ cap 32, and ggml_dequantize's output allocated with new_empty
+(0.44 s of zero fills per chunk). Applies after 0022, 0023 and 0024.
+
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -48,20 +48,36 @@
+     # weights once per step for up to 16 vectors, on the rows as they are
+     # (a merged layer's strided shard view included)
+     if (
+-        x.shape[0] <= GLUON_MAX_ROWS
++        x.shape[0] <= 2 * GLUON_MAX_ROWS
+         and weight_type in GLUON_TYPES
+         and x.dtype == torch.bfloat16
+     ):
+-        return gluon_mul_mat(x, weight, weight_type, weight.shape[0])
+-    if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
++        # gguf-rco step 6f: up to 32 rows (max-num-seqs x the verify batch) on
++        # the 16-row kernel, the rows in halves - twice the weight reads, not
++        # the dequantise path's write of the whole matrix per step
++        if x.shape[0] <= GLUON_MAX_ROWS:
++            return gluon_mul_mat(x, weight, weight_type, weight.shape[0])
++        return torch.cat(
++            [
++                gluon_mul_mat(x[:GLUON_MAX_ROWS], weight, weight_type, weight.shape[0]),
++                gluon_mul_mat(x[GLUON_MAX_ROWS:], weight, weight_type, weight.shape[0]),
++            ],
++            dim=0,
++        )
++    if x.shape[0] <= 2 * mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
++        # the batched MMVQ chunks by 16 rows; up to 32 rows it beats the
++        # dequantise path (gguf-rco step 6f)
+         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
+-    elif weight_type in MMQ_QUANT_TYPES:
+-        y = ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
+     elif weight_type in DEQUANT_TYPES:
++        # gguf-rco step 6f: prefill through dequantise + cuBLAS for every type;
++        # the plugin's MMQ measured 12 TFLOP/s on the K types against cuBLAS's
++        # bf16 GEMM at about 100 (the lab's prefill profile of 2026-09-14)
+         block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
+         shape = (weight.shape[0], weight.shape[1] // type_size * block_size)
+         weight = ops.ggml_dequantize(weight, weight_type, *shape, x.dtype)
+         y = x @ weight.T
++    elif weight_type in MMQ_QUANT_TYPES:
++        y = ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
+     else:
+         weight_type = WeightType(weight_type)
+         raise NotImplementedError(f"Unsupported GGUF quantization type: {weight_type}")
+@@ -261,7 +277,7 @@
+                 )
+                 shard = weight[start:end, :offset]
+                 if not (
+-                    x.shape[0] <= GLUON_MAX_ROWS
++                    x.shape[0] <= 2 * GLUON_MAX_ROWS
+                     and weight_type in GLUON_TYPES
+                     and x.dtype == torch.bfloat16
+                 ):
+--- a/vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu
++++ b/vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu
+@@ -90,7 +90,9 @@
+   const int32_t device_idx = W.get_device_index();
+   const DeviceGuard device_guard(device_idx);
+   const auto dtype_ = dtype.value_or(ScalarType::Half);
+-  Tensor DW = torch::stable::new_zeros(W, {m, n}, dtype_);
++  // gguf-rco step 6f: the dequantiser writes every element; a zero fill of the
++  // whole matrix per call cost 0.44 s per 8k-token prefill chunk
++  Tensor DW = torch::stable::new_empty(W, {m, n}, dtype_);
+   cudaStream_t stream = get_current_cuda_stream(device_idx);
+ 
+   VLLM_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
