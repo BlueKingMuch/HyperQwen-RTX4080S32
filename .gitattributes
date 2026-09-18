@@ -2,3 +2,9 @@
 # container image via `COPY . .`), so CRLF working trees break it. Force LF
 # regardless of the cloning machine's core.autocrlf.
 * text=auto eol=lf
+
+# The patch series is verified with `sha256sum`, so its bytes are the contract:
+# a CRLF checkout on Windows changes every hash and breaks each gate that reads
+# one. `-text` overrides the `text=auto eol=lf` line above for these files, so
+# git stores and checks them out byte for byte regardless of core.autocrlf.
+*.patch -text
