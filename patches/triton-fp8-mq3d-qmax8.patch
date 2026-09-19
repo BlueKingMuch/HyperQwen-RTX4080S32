@@ -1,0 +1,89 @@
+Triton attention: opt-in FP8 multi-query 3D Split-KV, off by default.
+
+The stock wrapper sends every max_seqlen_q > 1 call down the serial 2D path.
+A DFlash2 K7 step verifies eight query tokens per request, so target and draft
+attention both lose the 16-way Split-KV path that is already present. This
+exposes that kernel behind an off-by-default, FP8-per-tensor gate. QMAX
+defaults to 8 and is bounded to 2..16; unsupported widths, dtypes,
+batch-invariant mode, sequence counts and scratch capacities keep the 2D
+fallback.
+
+The scratch tensors are indexed by query token rather than by request. With
+the gate on and an FP8-per-tensor cache, the metadata builder allocates their
+maximum token capacity once before CUDA-graph capture and never grows or moves
+them afterwards; feature-off and non-FP8 caches keep the upstream allocation.
+Both graph-shaping values are registered so they enter the compile factors.
+BLOCK_M / BLOCK_Q and the kernel bodies are untouched.
+
+--- exported from qwen38/0.29-on-148 0790dc7 (triton-fp8-mq3d-qmax8); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/envs.py b/envs.py
+index 15e96bd..88920ee 100755
+--- a/envs.py
++++ b/envs.py
+@@ -193,6 +193,9 @@
+     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+     VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
+     VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"
++    # syv Ada experiment: opt-in FP8 multi-query 3D Triton attention.
++    VLLM_TRITON_FP8_MQ3D: bool = False
++    VLLM_TRITON_FP8_MQ3D_QMAX: int = 8
+     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
+     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
+     VLLM_HUMMING_USE_F16_ACCUM: bool = False
+@@ -1579,6 +1582,14 @@
+     "VLLM_MARLIN_INT8_EXCLUDE_RE": lambda: os.environ.get(
+         "VLLM_MARLIN_INT8_EXCLUDE_RE", "lm_head|mtp"
+     ),
++    # Opt-in FP8 multi-query 3D Triton attention. Registration makes both
++    # graph-shaping values part of vLLM's compile-factor environment.
++    "VLLM_TRITON_FP8_MQ3D": lambda: bool(
++        int(os.environ.get("VLLM_TRITON_FP8_MQ3D", "0"))
++    ),
++    "VLLM_TRITON_FP8_MQ3D_QMAX": lambda: int(
++        os.environ.get("VLLM_TRITON_FP8_MQ3D_QMAX", "8")
++    ),
+     # The online quantization dtype for humming kernel
+     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
+         os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
+diff --git a/v1/attention/ops/triton_unified_attention.py b/v1/attention/ops/triton_unified_attention.py
+index 4e2fa2d..e6dce87 100644
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -1057,9 +1057,26 @@
+             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
+         )
+ 
++    # Opt-in exception to the upstream multi-query exclusion. DFlash2 K7
++    # verifies up to eight rows per request; the 3D scratch is token-indexed,
++    # so every buffer must prove capacity for the captured q tensor. Any
++    # unsupported dtype, width, or capacity falls back to the original 2D
++    # path. The existing BLOCK_M / BLOCK_Q launch geometry is unchanged.
++    _fp8_mq3d_enabled = (
++        envs.VLLM_TRITON_FP8_MQ3D
++        and kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
++        and 1 < max_seqlen_q <= envs.VLLM_TRITON_FP8_MQ3D_QMAX
++        and softmax_segm_output is not None
++        and softmax_segm_max is not None
++        and softmax_segm_expsum is not None
++        and q.shape[0] <= softmax_segm_output.shape[0]
++        and q.shape[0] <= softmax_segm_max.shape[0]
++        and q.shape[0] <= softmax_segm_expsum.shape[0]
++    )
++
+     # Launch the 2D kernel if
+     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+-    # 2. The batch includes at least one prefill request, or
++    # 2. The batch is multi-query and the isolated FP8 MQ3D gate is not satisfied, or
+     # 3. The number of sequences exceeds the configured threshold, or
+     # 4. Batch invariance is enabled
+     use_3d = not (
+@@ -1068,7 +1085,7 @@
+         or softmax_segm_output is None
+         or softmax_segm_max is None
+         or softmax_segm_expsum is None
+-        or max_seqlen_q > 1
++        or (max_seqlen_q > 1 and not _fp8_mq3d_enabled)
+         or num_seqs > seq_threshold_3D
+         or is_batch_invariant
+     )

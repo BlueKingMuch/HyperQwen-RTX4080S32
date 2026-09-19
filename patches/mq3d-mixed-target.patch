@@ -1,0 +1,265 @@
+Apply the FP8 multi-query 3D path to the target's attention only, leaving the
+draft on the unmodified path, behind its own opt-in.
+
+The build produces target-only views; the original metadata and the KV writes
+stay intact. Adaptive verification can rewrite individual GPU query boundaries
+without changing their CPU mirrors, so those views are never sliced by CPU
+offsets, and padding, malformed boundaries and non-contiguous phases are
+rejected rather than reshaped.
+
+This switch shapes the graph and is deliberately NOT excluded from
+compile_factors.
+
+--- exported from qwen38/0.29-on-148 499912f (mq3d-mixed-target); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/envs.py b/envs.py
+index dc26821..0db14a8 100755
+--- a/envs.py
++++ b/envs.py
+@@ -197,6 +197,7 @@
+     VLLM_TRITON_FP8_MQ3D: bool = False
+     VLLM_TRITON_FP8_MQ3D_QMAX: int = 8
+     VLLM_TRITON_FP8_MQ3D_TRACE: bool = False
++    VLLM_TRITON_FP8_MQ3D_MIXED_TARGET: bool = False
+     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
+     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
+     VLLM_HUMMING_USE_F16_ACCUM: bool = False
+@@ -1591,6 +1592,10 @@
+     "VLLM_TRITON_FP8_MQ3D_QMAX": lambda: int(
+         os.environ.get("VLLM_TRITON_FP8_MQ3D_QMAX", "8")
+     ),
++    # Graph-affecting opt-in: intentionally NOT excluded from compile_factors.
++    "VLLM_TRITON_FP8_MQ3D_MIXED_TARGET": lambda: bool(
++        int(os.environ.get("VLLM_TRITON_FP8_MQ3D_MIXED_TARGET", "0"))
++    ),
+     "VLLM_TRITON_FP8_MQ3D_TRACE": lambda: bool(
+         int(os.environ.get("VLLM_TRITON_FP8_MQ3D_TRACE", "0"))
+     ),
+diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
+index 667de4a..000e68a 100644
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -33,6 +33,7 @@
+ from vllm.v1.attention.backends.utils import (
+     compute_mm_prefix_range_tensor,
+     get_num_attention_heads_from_layers,
++    split_decodes_and_prefills,
+ )
+ from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+@@ -275,6 +276,8 @@
+     mm_prefix_range_tensor: torch.Tensor | None = None
+     rswa_prefix_lens: torch.Tensor | None = None
+     rswa_window: int | None = None
++    # Opt-in Target-only views. Original metadata and KV writes remain intact.
++    mixed_target_mq3d: tuple["TritonAttentionMetadata", "TritonAttentionMetadata"] | None = None
+ 
+ 
+ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
+@@ -357,6 +360,34 @@
+             >= plan.capacity
+         ), "int4 3D scratch buffers disagree with the declared token capacity"
+         self.rswa_window = model_config.rswa_window
++        speculative = vllm_config.speculative_config
++        self._mixed_target_mq3d = (
++            envs.VLLM_TRITON_FP8_MQ3D_MIXED_TARGET
++            and envs.VLLM_TRITON_FP8_MQ3D
++            and not envs.VLLM_BATCH_INVARIANT
++            and vllm_config.parallel_config.tensor_parallel_size == 1
++            and vllm_config.parallel_config.pipeline_parallel_size == 1
++            and vllm_config.parallel_config.decode_context_parallel_size == 1
++            and vllm_config.parallel_config.prefill_context_parallel_size == 1
++            and kv_cache_spec.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
++            and vllm_config.compilation_config.cudagraph_mode.mixed_mode()
++            != CUDAGraphMode.FULL
++            # Adaptive verification can rewrite individual GPU query boundaries
++            # without changing their CPU mirrors. Never slice those by CPU offsets.
++            and (
++                speculative is None
++                or (
++                    speculative.method == "dflash"
++                    and not speculative.enable_adaptive_verification
++                )
++            )
++        )
++        self._mixed_prefill_cu = None
++        if self._mixed_target_mq3d:
++            self._mixed_prefill_cu = torch.empty(
++                vllm_config.scheduler_config.max_num_seqs + 1,
++                dtype=torch.int32, device=device,
++            )
+         self.persistent_rswa_prefix_lens: torch.Tensor | None = None
+         if self.rswa_window is not None:
+             self.persistent_rswa_prefix_lens = torch.empty(
+@@ -368,7 +399,7 @@
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+     ) -> TritonAttentionMetadata:
+-        attn_metadata = self.build(0, common_attn_metadata)
++        attn_metadata = self.build(0, common_attn_metadata, _skip_mixed_target=True)
+         # When doing full graph capture, setting seq_lens to
+         # max_model_len will cause graph capture to be extremely
+         # slow, so here we set it to 1.
+@@ -380,6 +411,7 @@
+         common_prefix_len: int,
+         common_attn_metadata: CommonAttentionMetadata,
+         fast_build: bool = False,
++        _skip_mixed_target: bool = False,
+     ) -> TritonAttentionMetadata:
+         num_reqs = common_attn_metadata.num_reqs
+         num_actual_tokens = common_attn_metadata.num_actual_tokens
+@@ -450,8 +482,84 @@
+             attn_metadata.rswa_prefix_lens = persistent_prefix_lens
+             attn_metadata.rswa_window = self.rswa_window
+ 
++        if self._mixed_target_mq3d and not _skip_mixed_target:
++            attn_metadata.mixed_target_mq3d = self._build_mixed_target_views(
++                common_attn_metadata, attn_metadata
++            )
+         return attn_metadata
+ 
++    def _build_mixed_target_views(self, common, metadata):
++        """Build bounded Decode-prefix/Prefill-suffix views once, not per layer."""
++        n = common.num_reqs
++        qmax = envs.VLLM_TRITON_FP8_MQ3D_QMAX
++        phases = common.is_prefilling
++        starts = common.query_start_loc_cpu
++        if (
++            not 2 <= n <= 4 or common.max_query_len <= qmax
++            or phases is None or phases.device.type != "cpu"
++            or phases.dtype != torch.bool or phases.shape != (n,)
++            or starts.device.type != "cpu" or starts.dtype != torch.int32
++            or starts.shape != (n + 1,)
++            or common.query_start_loc.dtype != torch.int32
++            or common.query_start_loc.shape != (n + 1,)
++            or common.causal is not True or metadata.use_cascade
++            or metadata.mm_prefix_range_tensor is not None
++            or metadata.rswa_prefix_lens is not None
++            or metadata.rswa_window is not None
++            or common.dcp_local_seq_lens is not None
++            or common.encoder_seq_lens is not None
++        ):
++            return None
++        cpu_starts = starts.tolist()
++        cpu_phases = phases.tolist()
++        lengths = [b - a for a, b in zip(cpu_starts, cpu_starts[1:])]
++        # Reject padding, malformed boundaries and non-contiguous phases.
++        # CPU boundaries are exact only in the non-adaptive runner arm.
++        if (
++            cpu_starts[0] != 0
++            or cpu_starts[-1] != common.num_actual_tokens
++            or min(lengths) <= 0
++            or max(lengths) != common.max_query_len
++            or not any(cpu_phases) or all(cpu_phases)
++        ):
++            return None
++        first_prefill = cpu_phases.index(True)
++        if (
++            not all(cpu_phases[first_prefill:])
++            or any(length > qmax for length in lengths[:first_prefill])
++            or first_prefill > self.seq_threshold_3D
++        ):
++            return None
++        nd, np, td, tp = split_decodes_and_prefills(
++            common, decode_threshold=qmax, require_uniform=False,
++            treat_short_extends_as_decodes=False,
++        )
++        if nd != first_prefill or np != n - nd or td != cpu_starts[nd] or tp <= 0:
++            return None
++        if td > min(
++            self.softmax_segm_output.shape[0], self.softmax_segm_max.shape[0],
++            self.softmax_segm_expsum.shape[0],
++        ):
++            return None
++        assert self._mixed_prefill_cu is not None
++        prefill_cu = self._mixed_prefill_cu[:np + 1]
++        # Device-to-device subtract on the current runner stream; no D2H/H2D,
++        # per-layer allocation or lifetime-sensitive pinned-host buffer.
++        torch.sub(common.query_start_loc[nd:], td, out=prefill_cu)
++        decode = replace(
++            metadata, num_actual_tokens=td, max_query_len=max(lengths[:nd]),
++            query_start_loc=common.query_start_loc[:nd + 1],
++            seq_lens=metadata.seq_lens[:nd], block_table=metadata.block_table[:nd],
++            slot_mapping=metadata.slot_mapping[:td], mixed_target_mq3d=None,
++        )
++        prefill = replace(
++            metadata, num_actual_tokens=tp, max_query_len=max(lengths[nd:]),
++            query_start_loc=prefill_cu, seq_lens=metadata.seq_lens[nd:],
++            block_table=metadata.block_table[nd:],
++            slot_mapping=metadata.slot_mapping[td:], mixed_target_mq3d=None,
++        )
++        return decode, prefill
++
+     def update_draft_decode_metadata(self, _metadata: TritonAttentionMetadata) -> None:
+         pass
+ 
+@@ -928,6 +1036,25 @@
+             )
+             return output
+ 
++        mixed = attn_metadata.mixed_target_mq3d
++        if (
++            mixed is not None
++            and self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
++            and self.attn_type == AttentionType.DECODER
++            and self.alibi_slopes is None and not self.use_alibi_sqrt
++            and self.sliding_window == (-1, -1) and self.sinks is None
++            and self.chunk_lookback == -1 and not self.use_td
++            and output_scale is None
++            and layer._q_scale.numel() == 1
++            and layer._k_scale.numel() == 1 and layer._v_scale.numel() == 1
++            and not getattr(layer, "mm_prefix_clamp_sliding_window", False)
++        ):
++            self._forward_mixed_target(
++                query, output, key_cache, value_cache, mixed,
++                q_descale, k_descale, v_descale,
++            )
++            return output
++
+         unified_attention(
+             q=query[:num_actual_tokens],
+             k=key_cache,
+@@ -971,6 +1098,43 @@
+ 
+         return output
+ 
++    def _forward_mixed_target(
++        self, query, output, key_cache, value_cache, mixed,
++        q_descale, k_descale, v_descale,
++    ):
++        """Same-stream decode producer/reducer, then disjoint 2D prefill."""
++        decode, prefill = mixed
++        nd = decode.seq_lens.shape[0]
++        for offset, metadata, rows, is_decode in (
++            (0, decode, slice(None, nd), True),
++            (decode.num_actual_tokens, prefill, slice(nd, None), False),
++        ):
++            stop = offset + metadata.num_actual_tokens
++            unified_attention(
++                q=query[offset:stop], k=key_cache, v=value_cache,
++                out=output[offset:stop],
++                cu_seqlens_q=metadata.query_start_loc,
++                max_seqlen_q=metadata.max_query_len,
++                seqused_k=metadata.seq_lens, max_seqlen_k=metadata.max_seq_len,
++                softmax_scale=self.scale, causal=True,
++                alibi_slopes=None, use_alibi_sqrt=False,
++                window_size=self.sliding_window, block_table=metadata.block_table,
++                softcap=self.logits_soft_cap, q_descale=q_descale,
++                k_descale=k_descale[rows], v_descale=v_descale[rows],
++                # Force suffix 2D. Decode retains all existing MQ3D gates.
++                seq_threshold_3D=metadata.seq_threshold_3D if is_decode else None,
++                num_par_softmax_segments=metadata.num_par_softmax_segments,
++                softmax_segm_output=metadata.softmax_segm_output if is_decode else None,
++                softmax_segm_max=metadata.softmax_segm_max if is_decode else None,
++                softmax_segm_expsum=metadata.softmax_segm_expsum if is_decode else None,
++                sinks=None, output_scale=None, mm_prefix_range=None,
++                rswa_prefix_lens=None, rswa_window=None,
++                kv_quant_mode=self._kv_quant_mode,
++                k_scale_cache=None, v_scale_cache=None,
++                chunk_lookback=self.chunk_lookback, use_td=False,
++                mm_prefix_clamp_sliding_window=False,
++            )
++
+     def _pth_key_value_caches(
+         self, kv_cache: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:

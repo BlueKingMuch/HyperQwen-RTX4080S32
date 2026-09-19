@@ -1,0 +1,96 @@
+Keep invalid draft distributions out of block verification and out of residual
+resampling.
+
+A NaN or +inf proposal has no usable probability ratio, and has to survive the
+reductions as invalid rather than be masked away like a legitimate -inf. Block
+verification looks ahead, so the whole proposal block is discarded; the bonus
+row, which has no cumulative ratio, carries the request's flag. With the
+proposals zeroed, the target sampler is reused directly instead of a residual
+distribution that does not exist.
+
+--- exported from qwen38/0.29-on-148 994091a (block-verification-invalid-draft); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 29b20af..c257587 100644
+--- a/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -290,6 +290,11 @@
+                 / temp
+             )
+             draft_max, draft_sumexp = _compute_max_and_sumexp(draft_logits)
++            # A masked -inf is valid; NaN/+inf must survive reductions as invalid.
++            invalid = tl.sum(((draft_logits != draft_logits) | (
++                draft_logits == float("inf")
++            )).to(tl.int32), axis=0) > 0
++            draft_sumexp = tl.where(invalid, float("nan"), draft_sumexp)
+             tl.store(
+                 draft_local_max_ptr + logit_idx * draft_local_max_stride + block_idx,
+                 draft_max,
+@@ -347,13 +352,14 @@
+         return
+ 
+     log_p = tl.zeros((), tl.float32)
++    invalid_draft = tl.full((), False, tl.int1)
+     for step in range(num_draft_tokens):
+         logit_idx = start_idx + step
+         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+         # -1 placeholder tokens can never be accepted. Skip their reductions
+         # and carry the last valid cumulative value.
+         if draft_token >= 0:
+-            target_logprob, draft_logprob, _, _ = (
++            target_logprob, draft_logprob, _, draft_lse = (
+                 _compute_global_logprobs_and_logsumexp(
+                     draft_token,
+                     True,  # mask
+@@ -379,8 +385,16 @@
+                     HAS_DRAFT_LOGITS,
+                 )
+             )
++            # Invalid or impossible proposals have no usable probability ratio.
++            # Block verification looks ahead: discard the whole proposal block.
++            invalid_draft |= ~(
++                (draft_lse > float("-inf")) & (draft_lse < float("inf"))
++                & (draft_logprob > float("-inf")) & (draft_logprob < float("inf"))
++            )
+             log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
+         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
++    # The bonus row has no cumulative ratio; reserve it for this request's flag.
++    tl.store(cumulative_log_p_ptr + end_idx - 1, invalid_draft.to(tl.float32))
+ 
+ 
+ @triton.jit
+@@ -547,6 +561,14 @@
+     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+     is_greedy = temp == 0.0
+ 
++    if USE_BLOCK_VERIFICATION and not is_greedy:
++        if tl.load(cumulative_log_p_ptr + end_idx - 1) != 0.0:
++            # Invalid-draft guard: zero proposals, then sample the target directly.
++            tl.store(rejected_steps_ptr + req_idx, 0)
++            tl.store(target_rejected_logsumexp_ptr + req_idx, 0.0)
++            tl.store(draft_rejected_logsumexp_ptr + req_idx, float("nan"))
++            return
++
+     accepted_length = tl.zeros((), tl.int64)
+     target_lse = 0.0
+     draft_lse = 0.0
+@@ -763,10 +785,16 @@
+         other=float("-inf"),
+     ).to(tl.float32)
+ 
++    # An invalid draft has no residual distribution. Reuse the target sampler,
++    # including its already-applied temperature/penalties and its RNG stream.
++    invalid_draft = tl.full((), False, tl.int1)
++    if HAS_DRAFT_LOGITS and not is_bonus:
++        draft_lse = tl.load(draft_rejected_logsumexp_ptr + req_idx)
++        invalid_draft = ~((draft_lse > float("-inf")) & (draft_lse < float("inf")))
++
+     # Compute the residual logits to resample the rejected token from.
+-    if is_bonus or not is_valid_rejected_draft:
+-        # Bonus token (no rejections) or -1 placeholder token. In either case,
+-        # directly use the target logits.
++    if is_bonus or not is_valid_rejected_draft or invalid_draft:
++        # Bonus, placeholder or invalid draft: directly use the target logits.
+         residual_logits = target_logits
+     elif HAS_DRAFT_LOGITS:
+         # draft_logits is stored pre-temperature, so apply scale first.

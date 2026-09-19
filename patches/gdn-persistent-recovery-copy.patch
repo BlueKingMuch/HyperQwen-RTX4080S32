@@ -1,0 +1,27 @@
+Fill the persistent GDN source-index buffer during metadata construction, and
+pass it on only when the step actually carries accepted-token indices.
+
+Without the copy the buffer keeps whatever the previous step left in it.
+
+--- exported from qwen38/0.29-on-148 b192805 (gdn-persistent-recovery-copy); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/attention/backends/gdn_attn.py b/v1/attention/backends/gdn_attn.py
+index 95f351c..141f254 100644
+--- a/v1/attention/backends/gdn_attn.py
++++ b/v1/attention/backends/gdn_attn.py
+@@ -578,6 +578,15 @@
+                 num_accepted_tokens = self.num_accepted_tokens[:batch_size]
+                 num_accepted_tokens[num_accepted:].fill_(1)
+ 
++            if spec_decode_src_indices is not None:
++                self.spec_decode_src_indices[:num_decodes].copy_(
++                    spec_decode_src_indices, non_blocking=True
++                )
++                spec_decode_src_indices = self.spec_decode_src_indices[
++                    :batch_size
++                ]
++                spec_decode_src_indices[num_decodes:].fill_(NULL_BLOCK_ID)
++
+         attn_metadata = GDNAttentionMetadata(
+             num_prefills=num_prefills,
+             num_prefill_tokens=num_prefill_tokens,
