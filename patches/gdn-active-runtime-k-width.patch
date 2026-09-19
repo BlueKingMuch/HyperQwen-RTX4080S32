@@ -1,0 +1,66 @@
+Slice the GDN spec-decode masks to the speculation width the step actually
+uses, instead of to the configured maximum.
+
+The width is read at runtime and asserted positive before it indexes anything.
+
+--- exported from qwen38/0.29-on-148 144130e (gdn-active-runtime-k-width); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/attention/backends/gdn_attn.py b/v1/attention/backends/gdn_attn.py
+index 141f254..219feba 100644
+--- a/v1/attention/backends/gdn_attn.py
++++ b/v1/attention/backends/gdn_attn.py
+@@ -238,6 +238,7 @@
+         )
+ 
+         spec_sequence_masks_cpu: torch.Tensor | None = None
++        active_spec_width = 0
+         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+             spec_sequence_masks = None
+             num_spec_decodes = 0
+@@ -315,6 +316,10 @@
+             assert spec_sequence_masks_cpu is not None
+             non_spec_sequence_masks_cpu = ~spec_sequence_masks_cpu
+             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
++            active_spec_width = int(
++                query_lens_cpu[spec_sequence_masks_cpu].max().item()
++            )
++            assert 1 < active_spec_width <= self.num_spec + 1
+ 
+             # Use CPU tensors to avoid CPU-GPU sync
+             non_spec_query_lens_cpu = query_lens_cpu[non_spec_sequence_masks_cpu]
+@@ -355,7 +360,7 @@
+                 )
+                 # Filter by spec_sequence_masks to exclude padded sequences
+                 spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
++                    spec_sequence_masks_cpu, :active_spec_width
+                 ]
+                 non_spec_state_indices_tensor = None
+                 # Padded sequences are always at the back, so the first
+@@ -376,7 +381,7 @@
+                 spec_token_indx = index[num_non_spec_tokens:]
+ 
+                 spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
++                    spec_sequence_masks_cpu, :active_spec_width
+                 ]
+                 non_spec_state_indices_tensor = block_table_tensor[
+                     non_spec_sequence_masks_cpu, 0
+@@ -511,10 +516,15 @@
+             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+         ):
+             assert spec_sequence_masks is not None
+-            self.spec_state_indices_tensor[:num_spec_decodes].copy_(
++            assert active_spec_width > 0
++            self.spec_state_indices_tensor[
++                :num_spec_decodes, :active_spec_width
++            ].copy_(
+                 spec_state_indices_tensor, non_blocking=True
+             )
+-            spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
++            spec_state_indices_tensor = self.spec_state_indices_tensor[
++                :batch_size, :active_spec_width
++            ]
+             spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
+ 
+             self.spec_sequence_masks[:num_spec_decodes].copy_(

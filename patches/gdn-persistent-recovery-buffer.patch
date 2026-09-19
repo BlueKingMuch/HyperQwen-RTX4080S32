@@ -1,0 +1,24 @@
+Allocate the GDN spec-decode source-index buffer once on the metadata builder
+instead of per step.
+
+A tensor allocated inside the step would not survive CUDA-graph capture as a
+stable pointer; a persistent buffer of the maximum shape does.
+
+--- exported from qwen38/0.29-on-148 61ece1b (gdn-persistent-recovery-buffer); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/attention/backends/gdn_attn.py b/v1/attention/backends/gdn_attn.py
+index b8a7eea..95f351c 100644
+--- a/v1/attention/backends/gdn_attn.py
++++ b/v1/attention/backends/gdn_attn.py
+@@ -169,6 +169,11 @@
+             dtype=torch.int32,
+             device=device,
+         )
++        self.spec_decode_src_indices: torch.Tensor = torch.empty(
++            (self.decode_cudagraph_max_bs,),
++            dtype=torch.int32,
++            device=device,
++        )
+ 
+     def _build_chunk_metadata(
+         self,
