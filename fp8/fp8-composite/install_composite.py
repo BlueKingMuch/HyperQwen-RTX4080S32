@@ -31,7 +31,7 @@ HERE = Path(__file__).resolve().parent
 DEPENDENCIES = {
     'flat/fp8_prefill_flat.py': 'd0d6ba88ad303929a4bd749338082872214b38963bf5c47c9fa81a854f0c3843',
     'flat/test_fp8_prefill_flat_cpu.py': '8b6c3008f03f44943c747d78367c7a3407c087394933f0b5618284281df623b2',
-    'decode_z/install_decode_segments.py': '9273a090f707aa3cc2c342618d74b828a83f1ed706f7e819ca52fc1442349d71',
+    'decode_z/install_decode_segments.py': '2c65f6ff03d98ad4d7d18bc8aeca68e3e15e5dadbb95bc9c47c291e650e1e8a0',
     'decode_z/test_decode_segments_cpu.py': 'fb41a5ec554421ef3f9e59c5c36c5beef44394258cef88a5c02e6dd22b42ae95',
 }
 

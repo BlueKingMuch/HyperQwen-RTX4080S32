@@ -65,3 +65,8 @@ triton-fp8-mq3d-qmax8.patch
 triton-fp8-mq3d-dispatch-trace.patch
 mq3d-mixed-target.patch
 block-verification-invalid-draft.patch
+
+# --- Upstream fixes -----------------------------------------------------------
+# Open upstream, carried here. Cut against the tree the whole series above
+# leaves behind, so this entry stays last.
+renderer-clamp-max-tokens.patch

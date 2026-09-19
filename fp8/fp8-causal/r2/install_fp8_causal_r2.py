@@ -6,7 +6,7 @@ from pathlib import Path
 import fp8_causal_r2 as candidate
 import install_fp8_causal as base
 
-ENV_INSTALLED_SHA='6761a702a2f5612f4e5615ba7a57587a46a30cf64a769bc36959fb09945fa978'
+ENV_INSTALLED_SHA='c1e3ca10ac7d16e681800cfbf05f3f02f35f27fd972267bffc59676e25ca3b05'
 
 
 def prepare(root,archive):

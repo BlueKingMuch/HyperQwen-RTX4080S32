@@ -1,0 +1,67 @@
+--- a/renderers/params.py
++++ b/renderers/params.py
+@@ -3,6 +3,7 @@
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+ 
++import vllm.envs as envs
+ from vllm.exceptions import VLLMValidationError
+ from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
+ from vllm.logger import init_logger
+@@ -321,6 +322,12 @@
+             # This prevents tokenization from taking up more resources than necessary
+             # while still failing `self._token_len_check` as expected by users
+             max_length = self.max_input_tokens + 1
++            if envs.VLLM_RENDERER_CLAMP_MAX_TOKENS and self.max_total_tokens is not None:
++                # The clamp compares the prompt against the whole window, so it
++                # must be able to see a prompt longer than the reduced input
++                # budget. Still capped one token past the window, so an
++                # oversized prompt is detected without tokenizing all of it.
++                max_length = self.max_total_tokens + 1
+ 
+         # Explicit truncation-side overrides require the full token sequence
+         # so we can slice from the requested side in _token_truncation.
+@@ -451,6 +458,11 @@
+     def _token_len_check(self, tokenizer: TokenizerLike | None, tokens: _S) -> _S:
+         """Apply length checks to prompt tokens if necessary."""
+         max_input_tokens = self.max_input_tokens
++        if envs.VLLM_RENDERER_CLAMP_MAX_TOKENS and self.max_total_tokens is not None:
++            # Treat max_output_tokens as a ceiling, not a reservation: the
++            # engine bounds generation at the context window anyway, so a
++            # prompt that fits the window is servable. See vLLM issue #42474.
++            max_input_tokens = self.max_total_tokens
+         if max_input_tokens is None:
+             return tokens
+ 
+--- a/envs.py
++++ b/envs.py
+@@ -193,6 +193,7 @@
+     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+     VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
+     VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"
++    VLLM_RENDERER_CLAMP_MAX_TOKENS: bool = False
+     # syv Ada experiment: opt-in FP8 multi-query 3D Triton attention.
+     VLLM_TRITON_FP8_MQ3D: bool = False
+     VLLM_TRITON_FP8_MQ3D_QMAX: int = 8
+@@ -1572,6 +1573,12 @@
+     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
+         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+     ),
++    # Opt-in: accept a request whose prompt fits the context window even when
++    # prompt + max_tokens would exceed it. Validation only; shapes no generated
++    # code, so it is deliberately absent from compile_factors.
++    "VLLM_RENDERER_CLAMP_MAX_TOKENS": lambda: bool(
++        int(os.environ.get("VLLM_RENDERER_CLAMP_MAX_TOKENS", "0"))
++    ),
+     # The activation dtype for marlin kernel
+     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
+         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+@@ -2416,6 +2423,8 @@
+     hash everything else. This keeps the cache key aligned across workers."""
+ 
+     ignored_factors: set[str] = {
++        # Request validation only; does not alter generated code.
++        "VLLM_RENDERER_CLAMP_MAX_TOKENS",
+         # Runtime-only dispatch evidence; does not alter generated code.
+         "VLLM_TRITON_FP8_MQ3D_TRACE",
+         "MAX_JOBS",
