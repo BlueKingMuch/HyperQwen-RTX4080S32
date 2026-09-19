@@ -10,7 +10,8 @@
 # What it does, in order:
 #   1. Refuses (exit 1) unknown values for the enumerated controls — CTX and
 #      SPEC in single-user mode, KV in batch mode. A typo'd profile must never
-#      boot the wrong geometry.
+#      boot the wrong geometry. CTX=fp8 and KV=fp8triton are the two that select
+#      the FP8 Triton attention set of fp8/; fp8/env.sh turns it on.
 #   2. Warns (stderr, continues) about controls that are set but silently
 #      ignored: CTX/SPEC in batch mode, KV in single-user mode, and launcher
 #      flags shadowed by EXTRA_ARGS (EXTRA_ARGS expands last, so it wins
@@ -47,8 +48,8 @@ resolve_effective_config() {
   local ctx=${CTX:-} spec=${SPEC:-} kv=${KV:-}
   if [ "$mode" = "single" ]; then
     ctx=${ctx:-fast}; spec=${spec:-mtp}
-    case "$ctx" in fast|long|huge) ;;
-      *) _refuse "unknown CTX=$ctx (want fast|long|huge)" ;;
+    case "$ctx" in fast|long|huge|fp8) ;;
+      *) _refuse "unknown CTX=$ctx (want fast|long|huge|fp8)" ;;
     esac
     case "$spec" in mtp|dflash2|off|none) ;;
       *) _refuse "unknown SPEC=$spec (want mtp|dflash2|off|none)" ;;
@@ -56,8 +57,8 @@ resolve_effective_config() {
     [ -z "${KV:-}" ] || _warn "KV=$KV is set but single-user mode ignores it (KV is a batch-mode control)"
   else
     kv=${kv:-fp8}
-    case "$kv" in fp8|kvarn|int4pth) ;;
-      *) _refuse "unknown KV=$kv (want fp8|kvarn|int4pth)" ;;
+    case "$kv" in fp8|fp8triton|kvarn|int4pth) ;;
+      *) _refuse "unknown KV=$kv (want fp8|fp8triton|kvarn|int4pth)" ;;
     esac
     [ -z "${CTX:-}" ] || _warn "CTX=$CTX is set but batch mode ignores it (CTX is a single-user control)"
     [ -z "${SPEC:-}" ] || _warn "SPEC=$SPEC is set but batch mode ignores it (SPEC is a single-user control)"

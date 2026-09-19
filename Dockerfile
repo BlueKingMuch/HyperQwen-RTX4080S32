@@ -1,7 +1,11 @@
 # Same stack as the README's venv install, frozen: Python 3.12 venv at /app/venv,
 # vLLM 0.29.0 (torch 2.13 / cu130 / Triton 3.7.1), every compatible patch in
-# patches/ applied,
-# the KVarN KV cache installed, verify.sh --install run at build time.
+# patches/ applied, the KVarN KV cache installed, the four FP8 Triton attention
+# steps of fp8/ installed, the GGUF plugin of gguf-plugin/ fetched, patched and
+# built for sm_89 and sm_120, verify.sh --install run at build time.
+#
+# Everything fp8/ and gguf-plugin/ add is off until an environment variable or a
+# .gguf model path turns it on; .env and docs/docker.md say which.
 #
 # The base image is CUDA "base" + nvcc, not "devel": vLLM's wheels bring their own
 # CUDA libraries, but FlashInfer JIT-compiles its fp8-KV attention kernel with nvcc
@@ -27,6 +31,11 @@ RUN venv/bin/pip install -r docker/requirements.txt
 COPY . .
 # Patch apply order lives in patches/series: a few patches carry hunk context
 # that an earlier patch adds, so the glob order of patches/*.patch is wrong.
+#
+# Then, in this order and for a reason:
+#   kvarn/install.sh       hunks cut against the tree the whole series leaves
+#   fp8/install.sh         four steps that pin the bytes the two above leave
+#   gguf-plugin/install.sh a separate package, so last; it patches nothing here
 RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -n1); \
     sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series | \
     while IFS= read -r name; do \
@@ -36,6 +45,9 @@ RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm
       echo "== $name"; patch -p1 --fuzz 0 --no-backup-if-mismatch -d "$SP" < "patches/$name"; \
     done; \
     bash kvarn/install.sh; \
+    bash fp8/install.sh; \
+    bash gguf-plugin/install.sh; \
+    ( cd gguf-plugin && ../venv/bin/python test_gguf_rco_cpu.py --names iq3s-tensor-names.json ); \
     bash verify.sh --install
 
 # HOME is a volume: torch.compile cache (~/.cache/vllm), Triton (~/.triton),

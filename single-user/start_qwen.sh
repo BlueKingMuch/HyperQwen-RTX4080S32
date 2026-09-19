@@ -144,6 +144,10 @@ GPU_UTIL=${GPU_UTIL:-0.93}
 API_SERVERS=${API_SERVERS:-1}
 # CTX=fast (default): bf16 KV via FlashAttention, ~64k context, 4 drafts (~+7%).
 # CTX=long: fp8 KV via FlashInfer, 150k context, 3 drafts.
+# CTX=fp8: fp8 KV on TRITON_ATTN with the four FP8 attention steps of fp8/,
+#          block size 896, the same 64k window as CTX=fast, 7 drafts. What the
+#          dtype buys here is the pool, not the window. The set is off on every
+#          other CTX because none of it applies to FlashAttention or FlashInfer.
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/ in this repo, run kvarn/install.sh
 #           once), 200k context with MTP. The decode tax is a function of context,
 #           not a constant: ~6% on short prompts, but 2.13x at 112k (32.0 vs fp8's
@@ -188,7 +192,37 @@ elif [ "$CTX" = "long" ]; then
   MAX_LEN=${MAX_LEN:-150000}
   DRAFT_TOKENS=${DRAFT_TOKENS:-3}
   ATTN_ARGS="--kv-cache-dtype fp8"
+elif [ "$CTX" = "fp8" ]; then
+  # fp8 KV on the TRITON_ATTN backend, which is the one geometry the four steps
+  # of fp8/ were cut for: 24 query heads, 4 KV heads, head_dim 256, block 896.
+  # CTX=long reaches the same KV dtype through FlashInfer and none of the
+  # kernels below apply there.
+  #
+  # --block-size 896 rather than the 880 vLLM picks on its own: V_CHUNKED
+  # stores V as one 32-token tile per chunk inside a KV block, so a tile must
+  # not cross a block. The kernel accepts both widths; 896 is 28 tiles of 32
+  # and 880 is 27.5, so only 896 makes the layout whole.
+  # 65536 and 8 seats: the fp8 pool holds 308,331 tokens at this window
+  # against bf16's 68,605, so what the dtype buys is the pool, not the window.
+  MAX_LEN=${MAX_LEN:-65536}
+  MAX_SEQS=${MAX_SEQS:-8}
+  GPU_UTIL=${GPU_UTIL:-0.88}
+  DRAFT_TOKENS=${DRAFT_TOKENS:-7}
+  MAX_BATCHED=${MAX_BATCHED:-2048}
+  ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype fp8_e4m3 --block-size ${BLOCK_SIZE:-896}"
+    # patches/triton-spec-attn-fp8-kv.patch runs the split-KV verify kernel on a
+    # per-tensor fp8 cache on TRITON_ATTN, and its gate is checked first in
+    # TritonAttentionImpl.forward(). At 1 the FP8 MQ3D path does not run.
+  export VLLM_SPEC_DECODE_ATTN=${SPEC_ATTN:-0}
 fi
+# FP8_KERNELS=1 is the default under CTX=fp8 and off everywhere else: the four
+# steps fp8/install.sh puts in the venv do nothing on any other backend, and
+# turning them on where they cannot apply only hides which arm is running.
+if [ "$CTX" = "fp8" ]; then FP8_KERNELS=${FP8_KERNELS:-1}; else FP8_KERNELS=${FP8_KERNELS:-0}; fi
+source "$REPO/fp8/env.sh" \
+  || { echo "start_qwen: cannot source $REPO/fp8/env.sh - refusing to boot" >&2; exit 1; }
+resolve_fp8_kernels "$FP8_KERNELS"
+resolve_gguf_args "$MODEL"
 if [ "$SPEC" = "dflash2" ] && [ "$CTX" = "long" ]; then
   # int8 per-token-head KV on the Triton backend: the same 5.2 GiB pool holds 136,429
   # tokens instead of 69,758, because patches/hybrid-sw-block-promote.patch stops the
@@ -207,8 +241,15 @@ elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "huge" ]; then
   # The split-KV verify attention is bf16-KV only -- the KVarN backend brings
   # its own dequant path, so the env stays off here.
   export VLLM_SPEC_DECODE_ATTN=0
+elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "fp8" ]; then
+  # fp8 KV on TRITON_ATTN: the drafter runs on the same backend and the same KV
+  # dtype as the target, which is what the FP8 MQ3D kernel needs to see on both
+  # sides of the verify step. The split-KV verify attention above is a separate
+    # sides of the verify step.
+  SPEC_KV=${SPEC_KV:-fp8_e4m3}
+  SPEC_BACKEND=${SPEC_BACKEND:-TRITON_ATTN}
 elif [ "$SPEC" = "dflash2" ] && [ "$CTX" != "fast" ]; then
-  echo "SPEC=dflash2 supports CTX=fast (bf16, 64k), CTX=long (int8, 128k) and CTX=huge (KVarN, 240k; kvarn/install.sh); CTX=$CTX keeps SPEC=mtp" >&2
+  echo "SPEC=dflash2 supports CTX=fast (bf16, 64k), CTX=long (int8, 128k), CTX=huge (KVarN, 240k; kvarn/install.sh) and CTX=fp8 (fp8 on TRITON_ATTN, 262k); CTX=$CTX keeps SPEC=mtp" >&2
   SPEC=mtp
 fi
 # gotcha 51 / #64: KVarN + MTP + prefix caching, all three, corrupts prompt_logprobs --
@@ -255,7 +296,25 @@ if [ "$SPEC" = "dflash2" ]; then
   # DRAFT_METHOD=dspark runs a DSpark drafter (RadixArk/Qwen3.8-27B-DSpark, seven drafts per
   # step like the shipped head) through the same profile; it needs
   # patches/dspark-draft-quant-config.patch and the architecture rename in the README.
-  SPEC_CFG="{\"method\":\"${DRAFT_METHOD:-dflash}\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
+  # The drafter inherits the target's backend unless it is told otherwise, which
+  # is right everywhere except CTX=fp8: there the two must agree explicitly, or
+  # the drafter's verify step runs on a backend with no FP8 MQ3D gate at all.
+  SPEC_EXTRA=""
+  [ -n "${SPEC_BACKEND:-}" ] && SPEC_EXTRA="$SPEC_EXTRA,\"attention_backend\":\"$SPEC_BACKEND\""
+  [ -n "${SPEC_KV:-}" ] && SPEC_EXTRA="$SPEC_EXTRA,\"kv_cache_dtype\":\"$SPEC_KV\""
+  # REJECT_BLOCK=1: block verification (Sun et al., arXiv 2403.10444) instead of
+  # vLLM's standard per-token acceptance test. Off by default here and nothing in
+  # this repo has measured it. What is established from the code
+  # (rejection_sampler_utils.py): at temperature 0 it is a no-op, because the
+  # greedy branch is tested first and is unchanged; above 0 it accepts on a
+  # different rule and can raise the accepted length, so it changes which tokens
+  # come out. patches/block-verification-invalid-draft.patch fixes one failure
+  # mode in that path, which is why it is reachable at all.
+  case "${REJECT_BLOCK:-0}" in 0|1) ;;
+    *) echo "start_qwen: REJECT_BLOCK=$REJECT_BLOCK (want 0 or 1)" >&2; exit 1 ;;
+  esac
+  [ "${REJECT_BLOCK:-0}" = 1 ] && SPEC_EXTRA="$SPEC_EXTRA,\"rejection_sample_method\":\"block\""
+  SPEC_CFG="{\"method\":\"${DRAFT_METHOD:-dflash}\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"$SPEC_EXTRA}"
   # The split-KV verify attention (patches/spec-decode-attn.patch) sizes its partial
   # buffers once for the longest query block it will see -- a captured CUDA graph holds
   # their addresses, so they must not be grown later.
@@ -365,6 +424,13 @@ if [ "$SPEC" = "dflash2" ]; then
     # than ~1.45); on 0.28 this branch exported VLLM_V2_CUDAGRAPH_MEM_MIB to tell the runner
     # so. vLLM 0.29 profiles its graph memory itself and nothing reads that knob any more
     # (the hunk that did retired with the port), so the pinned KV_MEM is the only budget here.
+  elif [ "$CTX" = "fp8" ]; then
+    # No pinned KV_MEM here. The three pins above are a 24 GiB card's budget
+    # measured against a 5.2 GiB pool; this arm sizes the pool from GPU_UTIL, so
+    # a larger card gets the pool it has room for rather than the one a 3090 had.
+    MAX_SEQS=${MAX_SEQS:-8}
+    MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-65536}}
+    KV_MEM=${KV_MEM-}
   elif [ "$CTX" = "long" ]; then
     # int8 KV: measured 136,429 tokens of pool at DFLASH_TOKENS=7 with prefix caching on
     # (138,696 without), against bf16's 69,758 in the same pinned 5.2 GiB. DFLASH_TOKENS>7
@@ -737,10 +803,11 @@ exec venv/bin/vllm serve "$MODEL" \
   --max-num-seqs $MAX_SEQS \
   --api-server-count $API_SERVERS \
   ${VISION_ARGS} \
+  "${GGUF_ARGS[@]}" \
   $ATTN_ARGS \
-  --mamba-ssm-cache-dtype float16 \
+  --mamba-ssm-cache-dtype ${MAMBA_SSM_DTYPE:-float16} \
   "${ASYNC_ARGS[@]}" \
-  --max-num-batched-tokens 2048 \
+  --max-num-batched-tokens ${MAX_BATCHED:-2048} \
   "${SPEC_ARGS[@]}" \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]${CG_MODE}}" \
   --reasoning-parser qwen3 \

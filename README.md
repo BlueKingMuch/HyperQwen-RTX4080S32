@@ -25,20 +25,63 @@ Four and eight concurrent requests run roughly a third faster. GSM8K 0.960.
 
 ## What is different here
 
-Nothing yet. Planned, not promised:
+Three things, all in the build, all off unless something turns them on.
 
-- vLLM 0.29 instead of 0.28 (upstream has this open as
-  [#106](https://github.com/syv-ai/HyperQwen/issues/106))
-- implementing the [GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF)
-  route for the same model, but set up a little cleaner, through an external fork of
-  [vllm-gguf-plugin](https://github.com/BlueKingMuch/vllm-gguf-plugin).
-  My own tests showed that this quantisation is, quality-wise and at least for my use cases,
-  very close to W4A16. At one or two concurrent requests it measured comparable speeds
-  and bought roughly twice the KV pool. Beyond that it gets slower: the 3-bit weights are
-  unpacked before they are multiplied, and the kernel doing it stops grouping past 32 rows.
+**vLLM 0.29.0 instead of 0.28.** Upstream's own port
+([syv-ai/HyperQwen#148](https://github.com/syv-ai/HyperQwen/pull/148)) is the
+base; `patches/series` carries its 38 entries and then nine more under an
+`# --- Ada additions ---` header. `patches/check_vllm_series.sh` takes all 47
+against a pristine `v0.29.0` and reports 46 applied with exact context, 5 of them
+at an offset, 0 with fuzz. Eight further patches from the same branch are not
+carried because upstream's series already does the same thing;
+[PATCHES.md](PATCHES.md) names each one.
 
-Anything that lands here will say how it was measured, with the command that
-produced the numbers. Anything that is a guess will say that it is a guess.
+**`fp8/` — four FP8 Triton attention steps.** `CTX=fp8` (single-user) or
+`KV=fp8triton` (batch) serves the fp8 KV cache on the Triton backend with
+full-causal attention, a flat prefill index mapping, 32 parallel softmax
+segments instead of 16, and V stored as one 32-token tile per chunk inside a KV
+block. All four default off and `verify.sh` checks that in the live environment
+registry. They apply to one geometry — 24 query heads, 4 KV heads, head_dim 256,
+block 896, sm89 — and on any other backend or dtype the original loops run.
+What the dtype buys on this card is the pool: 308,331 KV tokens against bf16's
+68,605 at the same 64k window. [fp8/README.md](fp8/README.md) has the pins, the
+reverse-byte proofs, and the one place where vLLM 0.29's scratch pool had to
+learn a second segment count.
+
+**`gguf-plugin/` — the out-of-tree GGUF plugin, installed by default.** Pinned
+commit, ten patches, twenty-six Gluon decode kernels, its CUDA extension built
+for sm_89 and sm_120 at image build. None of the plugin's source is carried
+here; `install.sh` fetches the archive and checks its sha256. It costs nothing at
+run time until a `MODEL=` path ends in `.gguf`, which is the whole of the
+plugin's claim on a model. The weights are not produced by this repository.
+
+`docker compose build` builds all of it and `verify.sh --install` is the gate.
+`docker-compose.yml` builds locally rather than pulling upstream's published
+image, because that image is a different stack under a name that looks like this
+one.
+
+## What it measures
+
+[docs/reproductions/ada-029-fp8-gguf.md](docs/reproductions/ada-029-fp8-gguf.md)
+has six arms, each started cold in its own project, with the numbers and the
+configuration that produced them.
+
+The short version, on this card:
+
+- **`CTX=fast` is unchanged** by any of the above. The additions cost it nothing.
+- **`CTX=fp8`** reaches 504 tok/s decode at eight concurrent requests against
+  396, with mean TTFT at 888 ms against 3,172, and a 4.5x KV pool. Its GSM8K in
+  four runs was 0.915 / 0.955 / 0.960 / 0.965, where bf16 and int8 stayed inside
+  0.950 to 0.965.
+- **`CTX=long`**, upstream's arm and untouched here, reaches 736 tok/s decode at
+  eight concurrent requests, the highest of any arm measured here.
+- **The GSQ-RCO IQ3_S checkpoint**, served through the plugin, is 5.6% faster at
+  one concurrent request and 39% slower at eight, with GSM8K indistinguishable
+  from W4A16 and 62% more KV pool at the same memory quota. That comparison is
+  one variable: same image, same envelope, different weights.
+
+The token cap the quality harness uses truncates 5 to 9 of its 200 questions in
+every arm measured here, including the baseline.
 
 ## Licence
 

@@ -1,0 +1,21 @@
+# The tree the two paged patches are cut against, and what they leave behind.
+# Four files, four stages: a hunk that lands somewhere plausible but wrong fails
+# here rather than in a kernel.
+#
+# Generated, not written: `FP8_PINS=write bash fp8/install.sh` runs the series
+# and rewrites this file from the tree at each stage. Regenerate it whenever
+# patches/series, kvarn/ or the fp8 steps above it move -- and follow it with
+# `bash fp8/install.sh --write-sums`, because this file is itself hashed by
+# fp8/SHA256SUMS and the gate would otherwise refuse the next run.
+#
+# stage                file                                              sha256
+tile-ptrs.before  v1/attention/ops/triton_unified_attention.py        60778cbd528eae576bea60abec19f22441ed38e958b8a4d98b9fd667f7cfc955
+tile-ptrs.after   v1/attention/ops/triton_unified_attention.py        924fc9ff4b2bab6f317924d68c977eafee102eb4c61ea6ebcec8ccc13ce6b6fa
+v-chunked.before  v1/attention/ops/triton_unified_attention.py        924fc9ff4b2bab6f317924d68c977eafee102eb4c61ea6ebcec8ccc13ce6b6fa
+v-chunked.before  v1/attention/ops/triton_reshape_and_cache_flash.py  6cac51475b8c656992a21b2d150acd3a16a95a7ab7d49aab151a3ef13c24b80d
+v-chunked.before  v1/attention/backends/triton_attn.py                7ac1cdb19ba23fc12a0faf664d30ee42287ec7a31823ea6c6216fbf556e59bdc
+v-chunked.before  envs.py                                             1e2797438d0cd99401d8307fcf606d03d28d57c0ce56f167456858222469374e
+v-chunked.after   v1/attention/ops/triton_unified_attention.py        7745c740bc5e00d78156c9214f78c2e3765ae76e062e93ee5506ffe8ea64bd31
+v-chunked.after   v1/attention/ops/triton_reshape_and_cache_flash.py  f1efd768ad2665812542c841833ebf2ee531eeeea920293d1bc73ed475eed004
+v-chunked.after   v1/attention/backends/triton_attn.py                ec2c87616ef15fe4cef2a7d7bae3e6152f3e994fc233519f7e4bbd32af9d07a4
+v-chunked.after   envs.py                                             d36adfce2a84e530cdcbf1220eca75f12224a89db38a6d8b66735cb465da10d7

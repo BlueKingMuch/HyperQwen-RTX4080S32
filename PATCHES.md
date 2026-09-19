@@ -60,6 +60,54 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | kvarn/kvarn-0.29.0 | feature | KVarN cache dtypes, quant mode, backend registration, page size | none (KVarN is Huawei CSL's, Apache-2.0) | 0.29.0; attn_utils view hunk retired | upstreamed |
 | kvarn/kvarn-v2-runner-0.29.0 | own | KVarN with the V2 runner and DFlash2 (SW groups, Mamba block index, selector guards) | none | 0.29.0; kv_cache_utils hunks retired | rides with KVarN |
 
+Below the `# --- Ada additions ---` header in `patches/series`, applied after everything above and exported from
+`qwen38/0.29-on-148`, a branch rooted at the tree the series above leaves behind:
+
+| patch | kind | what | upstream | cut against | retires when |
+|---|---|---|---|---|---|
+| gdn-spec-state-recovery-core | fix | accepted-token source indices reach the GDN and causal-conv1d kernels, so a speculative step recovers the recurrent state from the row it was written to | none yet | 0.29.0 + the series above | upstream PR |
+| mamba-align-row-null-bounds | fix | accepted-token block-table columns masked against the request's own row width | none yet | 0.29.0 + the series above | upstream PR |
+| gdn-persistent-recovery-buffer | own | the source-index buffer allocated once on the builder, so it survives graph capture | none | 0.29.0 + the series above | rides with gdn-spec-state-recovery-core |
+| gdn-persistent-recovery-copy | own | that buffer filled during metadata build | none | 0.29.0 + the series above | rides with gdn-spec-state-recovery-core |
+| gdn-active-runtime-k-width | own | spec masks sliced to the width the step uses | none | 0.29.0 + the series above | rides with gdn-spec-state-recovery-core |
+| triton-fp8-mq3d-qmax8 | feature | opt-in FP8 multi-query 3D Split-KV; registers `VLLM_TRITON_FP8_MQ3D`, `_QMAX` | none | 0.29.0 + the series above | upstreamed |
+| triton-fp8-mq3d-dispatch-trace | feature | opt-in INFO-once 2D/3D dispatch screening | none | 0.29.0 + the series above | rides with triton-fp8-mq3d-qmax8 |
+| mq3d-mixed-target | feature | the FP8 MQ3D path on the target's attention only; registers `VLLM_TRITON_FP8_MQ3D_MIXED_TARGET` | none | 0.29.0 + the series above | rides with triton-fp8-mq3d-qmax8 |
+| block-verification-invalid-draft | fix | NaN/+inf proposals survive the reductions as invalid and the block is discarded | none yet | 0.29.0 + the series above | upstream PR |
+
+The two multi-query 3D paths in this tree do not compete. Upstream's is int4, under `VLLM_INT4_MQ_3D` in
+`int4_per_token_head.py`; this one is fp8 per-tensor, under `VLLM_TRITON_FP8_MQ3D` in `triton_unified_attention.py`.
+Disjoint knobs, disjoint files, and mutually exclusive by KV cache dtype. Where both gate the same call site --
+`TritonAttentionImpl.forward()` -- upstream's `_spec_attn_run_fp8` is checked first and returns; the fp8 MQ3D gate
+below it runs when `VLLM_SPEC_DECODE_ATTN` is off, which is its default.
+
+Eight more from the same branch are **not** carried, because the series above already does the same thing:
+`dflash-compressed-qkv-context-buffer` (the same WNA16 KV unpack in `qwen3_dflash.py`), `hybrid-kv-group-sizing` and
+`hybrid-kv-group-capacity-cost` (`hybrid-sw-block-promote`), `dflash2-request-topk-topp`
+(`dflash2-lookup-drafting` carries `req_top_p`/`req_top_k` in the kernel), `dflash2-prewarm` (in the series already),
+`triton-zero-length-segment-guard` (`spec-decode-int4-kv-mq3d` adds byte-identical code to `reduce_segments()`),
+`mamba-resume-block-size` (upstream resumes from `_mamba_spec.block_size` with a fallback instead of an assert) and
+`vision-tower-cpu-offload` (both the knob and the `UVAOffloader` call in `qwen3_vl.py`).
+
+## Not patch files
+
+Three directories install after `patches/series` without going through it, and the Dockerfile runs them in this order.
+`kvarn/` and `fp8/` change the vLLM package itself, `fp8/` after `kvarn/` because it pins bytes `kvarn/` leaves behind;
+`gguf-plugin/` installs a separate package, touches nothing under `vllm/` and therefore pins nothing of this tree, which
+is why it goes last:
+
+| step | kind | what | how it is checked |
+|---|---|---|---|
+| `kvarn/install.sh` | feature | the KVarN KV cache, two patches plus its modules | two rows above; `verify.sh` reverse-dry-runs both patches |
+| `fp8/install.sh` | feature | four FP8 Triton attention steps, all off by default (`fp8/README.md`) | each step pins what it reads and proves its output reverses to its parent; `verify.sh` re-derives the published seal from the archived parents |
+| `gguf-plugin/install.sh` | feature | the out-of-tree GGUF plugin at a pinned commit, ten patches, twenty-six Gluon decode kernels | three hash gates (`gguf-plugin/README.md`); `verify.sh` checks the package, its extension and its model test |
+
+`fp8/` is where the FP8 attention flags come from that `patches/triton-fp8-mq3d-qmax8.patch` and
+`patches/mq3d-mixed-target.patch` above only half describe: those two register `VLLM_TRITON_FP8_MQ3D` and
+`_MIXED_TARGET`, and `fp8/install.sh` adds `VLLM_TRITON_FP8_CAUSAL_FULL`, `_PREFILL_FLAT`, `_MQ3D_SEGMENTS` and
+`_V_CHUNKED` beside them. `fp8/env.sh` turns the set on together; `CTX=fp8` and `KV=fp8triton` are the launcher
+routes.
+
 Retired at 0.29.0 and removed from the tree: `vllm-pr54282-draft-gumbel-salt` (vllm #54282, in 0.29.0),
 `xgrammar-spec-terminated` (in 0.29.0), and `sse-keep-alive` (vllm 585bb07c7, in 0.29.0 and not in
 0.28.0; the `--sse-keep-alive-interval` flag is unchanged, so nothing that sets it needs to change).

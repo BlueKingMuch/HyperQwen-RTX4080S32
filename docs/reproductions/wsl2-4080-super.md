@@ -65,5 +65,6 @@ pandas without it.
 
 The published image carries it. [docs/docker.md](../docker.md) offers
 `docker compose build` as the alternative to pulling; the field-test protocol in
-the README asks for the battery. `pyarrow==21.0.0` in `docker/requirements.txt`
-fixes it.
+the README asks for the battery. `docker/requirements.txt` in this fork now pins
+`pyarrow==21.0.0`; the GSM8K number above was measured with it installed by hand
+into a running container.

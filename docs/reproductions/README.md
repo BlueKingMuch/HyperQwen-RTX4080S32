@@ -16,6 +16,10 @@ full reproductions; the list below collects the shorter reports from issues.
 - [wsl2-4080-super.md](wsl2-4080-super.md) — RTX 4080 SUPER 32 GB (sm89, Ada)
   under Windows 11 / WSL2, from an image built out of the repo rather than
   pulled: Setup B cohorts, GSM8K, and the `pyarrow` gap in the image build
+- [ada-029-fp8-gguf.md](ada-029-fp8-gguf.md) — the same card on vLLM 0.29 with
+  the FP8 attention steps and the GGUF plugin: six arms, KV pools, the
+  768-token cap the quality harness never reports, and GSQ-RCO IQ3_S against
+  W4A16 at one variable
 
 ## Results from other hardware
 
