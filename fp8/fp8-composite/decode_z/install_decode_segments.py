@@ -16,7 +16,7 @@ FILES=dict(unified='v1/attention/ops/triton_unified_attention.py',
 PINS=dict(unified='b428d0a7680242917e825e5146bb7b35e3a013eb984f3fc34c923d33eebe65c7',
           helpers='8c730611e7b3c5fb7579ec7846d56a2ab7e348ce06b39136da22072ecc363c95',
           backend='c01afe31a641ce6c772b41b6b319d6d5a64810a3fbdf6edc727d006e83a4bdde',
-          env='6761a702a2f5612f4e5615ba7a57587a46a30cf64a769bc36959fb09945fa978')
+          env='c1e3ca10ac7d16e681800cfbf05f3f02f35f27fd972267bffc59676e25ca3b05')
 ENV_ENTRY=f'    "{FLAG}": lambda: int(os.environ.get("{FLAG}", "16")),\n'
 ANCHOR='NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments\n'
 HELPER='''

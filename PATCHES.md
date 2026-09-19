@@ -108,6 +108,18 @@ is why it goes last:
 `_V_CHUNKED` beside them. `fp8/env.sh` turns the set on together; `CTX=fp8` and `KV=fp8triton` are the launcher
 routes.
 
+## Upstream fixes
+
+Open upstream and carried here. Last in `patches/series`, cut against the tree everything above it leaves behind.
+
+| patch | kind | what | upstream | cut against | retires when |
+|---|---|---|---|---|---|
+| renderer-clamp-max-tokens | fix | `VLLM_RENDERER_CLAMP_MAX_TOKENS`: a prompt that fits the context window is servable even when `prompt + max_tokens` would exceed it | vllm [#42474](https://github.com/vllm-project/vllm/issues/42474), open | 0.29.0 + the series above | upstream takes it |
+
+Upstream refuses such a request with HTTP 400, because `max_input_tokens` is `max_total_tokens - max_output_tokens` and the prompt is checked against that. A client that sends a fixed safety cap therefore cannot use long contexts at all. The flag moves the check to the whole window in `_token_len_check`, and stops `get_encode_kwargs` capping tokenization below it so the real prompt length is visible to that comparison. Generation is unaffected either way: the engine already bounds it at the window. A prompt that genuinely does not fit is still rejected, and tokenization still stops one token past the window rather than reading all of an oversized prompt.
+
+Default off. It is in `compile_factors`' ignore list because it shapes no generated code -- without that entry, toggling a validation-only switch would invalidate every compiled artifact, since `compile_factors()` starts from every env var and subtracts the ignored ones.
+
 Retired at 0.29.0 and removed from the tree: `vllm-pr54282-draft-gumbel-salt` (vllm #54282, in 0.29.0),
 `xgrammar-spec-terminated` (in 0.29.0), and `sse-keep-alive` (vllm 585bb07c7, in 0.29.0 and not in
 0.28.0; the `--sse-keep-alive-interval` flag is unchanged, so nothing that sets it needs to change).
