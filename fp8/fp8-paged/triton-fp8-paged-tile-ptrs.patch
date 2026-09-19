@@ -1,0 +1,147 @@
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -196,6 +196,57 @@
+     alpha = tl.exp(M - m_j)
+     L_new = L * alpha + l_j
+     return m_j, L_new, P, alpha
++
++
++@triton.jit
++def _paged_tile_ptrs(
++    block_table_row_ptr,
++    key_cache_ptr,
++    value_cache_ptr,
++    tile_idx,
++    offs_t,
++    stride_k_cache_0,
++    stride_k_cache_1,
++    stride_v_cache_0,
++    stride_v_cache_1,
++    BLOCK_SIZE: tl.constexpr,
++    TILE_SIZE: tl.constexpr,
++):
++    """Per-position K and V page pointers of one KV tile, from two scalars.
++
++    ``TILE_SIZE`` consecutive positions span at most two physical blocks
++    (``BLOCK_SIZE >= TILE_SIZE``), so the block-table lookup, the
++    ``// BLOCK_SIZE`` / ``% BLOCK_SIZE`` and the 64-bit page-base products
++    are done once per tile, on scalars.  Each position then selects one of
++    the two page pointers and adds its 32-bit in-block offset (a block's
++    bytes, ``BLOCK_SIZE * stride_1``, fit in 32 bits for any vLLM cache).
++    The addressed bytes equal the per-position form
++
++        cache + block_table[pos // BLOCK_SIZE] * stride_0 + (pos % BLOCK_SIZE) * stride_1
++
++    for every position ``pos = tile_idx * TILE_SIZE + offs_t``, and the
++    block table is read at the same entries (the second one only when the
++    tile crosses a block boundary).  Returns ``(physical_block_idx,
++    slot_in_block, k_tok_ptr, v_tok_ptr)``; the first two feed the
++    per-(token, head) scale caches.
++    """
++    tl.static_assert(BLOCK_SIZE >= TILE_SIZE)
++    tile_start = tile_idx * TILE_SIZE
++    blk0 = tile_start // BLOCK_SIZE
++    rem0 = tile_start - blk0 * BLOCK_SIZE
++    crosses = rem0 + TILE_SIZE > BLOCK_SIZE
++    phys0 = tl.load(block_table_row_ptr + blk0)
++    phys1 = tl.load(block_table_row_ptr + blk0 + 1, mask=crosses, other=0)
++    k_page0 = key_cache_ptr + phys0.to(tl.int64) * stride_k_cache_0
++    k_page1 = key_cache_ptr + phys1.to(tl.int64) * stride_k_cache_0
++    v_page0 = value_cache_ptr + phys0.to(tl.int64) * stride_v_cache_0
++    v_page1 = value_cache_ptr + phys1.to(tl.int64) * stride_v_cache_0
++    wrap = offs_t >= BLOCK_SIZE - rem0
++    physical_block_idx = tl.where(wrap, phys1, phys0).to(tl.int64)
++    slot_in_block = tl.where(wrap, rem0 - BLOCK_SIZE, rem0) + offs_t
++    k_tok_ptr = tl.where(wrap, k_page1, k_page0) + slot_in_block * stride_k_cache_1.to(tl.int32)
++    v_tok_ptr = tl.where(wrap, v_page1, v_page0) + slot_in_block * stride_v_cache_1.to(tl.int32)
++    return physical_block_idx, slot_in_block, k_tok_ptr, v_tok_ptr
+ 
+ 
+ @triton.jit
+@@ -835,9 +886,26 @@
+             seq_offset = j * TILE_SIZE + offs_t
+             tile_mask = seq_offset < max_seq_prefix_len
+ 
+-            physical_block_idx = tl.load(
+-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+-            ).to(tl.int64)
++            # Paged addressing resolved once per tile from two scalars; the
++            # addressed bytes are identical (see _paged_tile_ptrs).
++            (
++                physical_block_idx,
++                slot_in_block,
++                k_tok_ptr,
++                v_tok_ptr,
++            ) = _paged_tile_ptrs(
++                block_tables_ptr + block_table_offset,
++                key_cache_ptr,
++                value_cache_ptr,
++                j,
++                offs_t,
++                stride_k_cache_0,
++                stride_k_cache_1,
++                stride_v_cache_0,
++                stride_v_cache_1,
++                BLOCK_SIZE,
++                TILE_SIZE,
++            )
+ 
+             if USE_TD:
+                 # All TILE_SIZE slots within a single KV tile map to one
+@@ -879,27 +947,27 @@
+                     HEAD_SIZE_PADDED,
+                 )
+             else:
+-                v_offset = (
+-                    physical_block_idx[:, None] * stride_v_cache_0
+-                    + kv_head_idx * stride_v_cache_2
++                # In-block (head, dim) offsets are 32-bit; the page pointer
++                # carries the 64-bit part.
++                v_ptrs = (
++                    v_tok_ptr[:, None]
++                    + (kv_head_idx * stride_v_cache_2).to(tl.int32)
+                     + offs_d[None, :] * stride_v_cache_3
+-                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+-                )
+-                k_offset = (
+-                    physical_block_idx[None, :] * stride_k_cache_0
+-                    + kv_head_idx * stride_k_cache_2
++                )
++                k_ptrs = (
++                    k_tok_ptr[None, :]
++                    + (kv_head_idx * stride_k_cache_2).to(tl.int32)
+                     + offs_d[:, None] * stride_k_cache_3
+-                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                 )
+                 # K : (HEAD_SIZE, TILE_SIZE)
+                 K_load = tl.load(
+-                    key_cache_ptr + k_offset,
++                    k_ptrs,
+                     mask=dim_mask[:, None] & tile_mask[None, :],
+                     other=0.0,
+                 )
+                 # V : (TILE_SIZE, HEAD_SIZE)
+                 V_load = tl.load(
+-                    value_cache_ptr + v_offset,
++                    v_ptrs,
+                     mask=dim_mask[None, :] & tile_mask[:, None],
+                     other=0.0,
+                 )
+@@ -910,7 +978,7 @@
+             if USE_PER_TOKEN_HEAD_SCALES:
+                 scale_idx = (
+                     physical_block_idx * stride_ks_blk
+-                    + (seq_offset % BLOCK_SIZE) * stride_ks_slot
++                    + slot_in_block * stride_ks_slot
+                     + kv_head_idx * stride_ks_head
+                 )
+                 k_token_head_scales = tl.load(
+@@ -918,7 +986,7 @@
+                 )
+                 v_scale_idx = (
+                     physical_block_idx * stride_vs_blk
+-                    + (seq_offset % BLOCK_SIZE) * stride_vs_slot
++                    + slot_in_block * stride_vs_slot
+                     + kv_head_idx * stride_vs_head
+                 )
+                 v_token_head_scales = tl.load(

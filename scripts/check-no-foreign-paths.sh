@@ -26,18 +26,19 @@ SELF="scripts/$(basename -- "${BASH_SOURCE[0]}")"
 # upstream issues constantly (issues/62, issues/105). Only the zero-padded form
 # is matched, which GitHub never produces and a local numbering scheme does.
 RULES=(
-$'(^|[^A-Za-z0-9_./-])ctx/\ta context directory outside this repository'
-$'(^|[^A-Za-z0-9_./-])experiments/\tan experiment tree outside this repository'
+$'(^|[^A-Za-z0-9_-])ctx/\ta context directory outside this repository'
+$'(^|[^A-Za-z0-9_-])experiments/\tan experiment tree outside this repository'
 $'issues/0[0-9]{3}\ta zero-padded issue number; GitHub issue links are not padded'
 $'patch-series@local\ta placeholder author from a local format-patch run'
 $'^Source:[[:space:]]\ta Source: header naming the tree a patch came from'
 $'v0[0-9]{2}-[a-z0-9]+-20[0-9]{6}\ta dated build tag from another repository'
-$'(^|[^A-Za-z0-9_./-])migrations/\ta migration tree outside this repository'
+$'(^|[^A-Za-z0-9_-])migrations/\ta migration tree outside this repository'
 $'ctx-overlay\ta build-context overlay outside this repository'
 $'assemble-context\.py\ta build-context assembler outside this repository'
-$'(^|[^A-Za-z0-9_./-])\.dev/\ta private working directory'
-$'(^|[^A-Za-z0-9_./-])provenance/\ta provenance tree outside this repository'
-$'(^|[^A-Za-z0-9_./-])model-pipeline/\ta model pipeline outside this repository'
+$'(^|[^A-Za-z0-9_-])\.dev/\ta private working directory'
+$'(^|[^A-Za-z0-9_-])provenance/\ta provenance tree outside this repository'
+$'(^|[^A-Za-z0-9_-])model-pipeline/\ta model pipeline outside this repository'
+$'[Dd]onor\ta reference to the tree some of this work came from'
 )
 
 fail=0
@@ -49,7 +50,15 @@ mapfile -t FILES < <(git ls-files | grep -vxF "$SELF")
 for rule in "${RULES[@]}"; do
   pattern=${rule%%$'\t'*}
   meaning=${rule#*$'\t'}
-  if hits=$(grep -InE -- "$pattern" "${FILES[@]}" 2>/dev/null); then
+  hits=$(grep -InE -- "$pattern" "${FILES[@]}" 2>&1) && rc=0 || rc=$?
+  if [ $rc -gt 1 ]; then
+    # grep exits 2 for an error and 1 for "no match". Treating them alike would
+    # skip a rule in silence, which is the one thing this check must not do.
+    echo "FAIL: grep could not apply the rule for $meaning (exit $rc)"
+    echo "$hits" | sed 's/^/    /'
+    echo
+    fail=1
+  elif [ $rc -eq 0 ]; then
     echo "FAIL: $meaning"
     echo "$hits" | sed 's/^/    /'
     echo

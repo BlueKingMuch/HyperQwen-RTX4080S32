@@ -26,6 +26,19 @@ set -euo pipefail
 # the change and re-export.
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(dirname "$HERE")"
+# The interpreter this repo installs into. kvarn/install.sh resolves it the same
+# way: without it, a bare `python3` puts the plugin in the system interpreter
+# while vLLM lives in /app/venv, and `import vllm_gguf_plugin` then fails for
+# the server that needs it.
+PY=${PY:-$REPO/venv/bin/python}
+# Outside the repo's venv -- a --check run on a machine that has no install --
+# take the first interpreter that is actually there and runs.
+if [ ! -x "$PY" ]; then
+  for c in python3 python; do
+    command -v "$c" >/dev/null 2>&1 && "$c" -c '' 2>/dev/null && { PY=$c; break; }
+  done
+fi
 
 PIN=d4c1f0d082fc7cd4350da56689109a01c1f29d6c
 ARCHIVE_URL="https://github.com/vllm-project/vllm-gguf-plugin/archive/${PIN:0:12}.tar.gz"
@@ -82,10 +95,10 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 say "the plugin's own dependencies"
-python3 -m pip install --no-cache-dir --no-deps --require-hashes -r "$HERE/requirements.txt"
+"$PY" -m pip install --no-cache-dir --no-deps --require-hashes -r "$HERE/requirements.txt"
 
 say "upstream at ${PIN:0:12}"
-python3 - "$ARCHIVE_URL" "$WORK/plugin.tar.gz" <<'PY'
+"$PY" - "$ARCHIVE_URL" "$WORK/plugin.tar.gz" <<'PY'
 import sys, urllib.request
 urllib.request.urlretrieve(sys.argv[1], sys.argv[2])
 PY
@@ -132,13 +145,14 @@ echo "   6 files: OK"
 
 say "building for TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
 ( cd "$SRC" && TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" MAX_JOBS="$MAX_JOBS" \
-    python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . )
+    "$PY" -m pip install --no-cache-dir --no-deps --no-build-isolation . )
 
 say "what landed"
-ROOT=$(python3 -c 'import vllm_gguf_plugin, os; print(os.path.dirname(os.path.dirname(vllm_gguf_plugin.__file__)))')
+ROOT=$("$PY" -c 'import vllm_gguf_plugin, os; print(os.path.dirname(os.path.dirname(vllm_gguf_plugin.__file__)))' 2>/dev/null | tail -n1)
+[ -n "$ROOT" ] && [ -d "$ROOT" ] || { echo "ERROR: cannot import vllm_gguf_plugin with $PY" >&2; exit 1; }
 ( cd "$ROOT" && printf '%s\n' "$AFTER" | grep -vE 'csrc/' | sha256sum -c - >/dev/null ) \
   || { echo "ERROR: the installed package does not match what was built." >&2; exit 1; }
 echo "   3 files: OK"
 
 echo "gguf-plugin: installed"
-echo "run the CPU gate with:  python3 $HERE/test_gguf_rco_cpu.py"
+echo "run the CPU gate with:  $PY $HERE/test_gguf_rco_cpu.py"

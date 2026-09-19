@@ -22,6 +22,17 @@ export PATH="$REPO/venv/bin:$PATH"
 export OPENAI_API_KEY=${VLLM_API_KEY:-$(cat "$REPO/api_key.txt" 2>/dev/null)}
 HOST=${HOST:-127.0.0.1}; PORT=${PORT:-18020}
 MODEL=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound}
+# --model here is the bench CLIENT's tokenizer, not the served model -- that is
+# --served-model-name below. A .gguf MODEL is a file rather than a directory, and
+# the client stalls on it without ever sending a request: the server answers
+# /health the whole time, so it reads as a hang. Take the hfconfig/ directory
+# beside the weights, which is what single-user/start_qwen.sh hands the server as
+# --tokenizer for the same model.
+case "$MODEL" in *.gguf)
+  _gd=$(dirname "$MODEL")
+  MODEL=$_gd; [ -d "$_gd/hfconfig" ] && MODEL=$_gd/hfconfig
+  echo "bench: MODEL is a .gguf; tokenizing with $MODEL" >&2 ;;
+esac
 B="venv/bin/vllm bench serve --host $HOST --port $PORT --model $MODEL --served-model-name qwen3.8-27b"
 OUT=${OUT:-$HERE/results}; mkdir -p "$OUT"
 

@@ -1,0 +1,752 @@
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -211,6 +211,8 @@
+     stride_v_cache_1,
+     BLOCK_SIZE: tl.constexpr,
+     TILE_SIZE: tl.constexpr,
++    V_CHUNKED: tl.constexpr = False,
++    V_CHUNK_STRIDE: tl.constexpr = 0,
+ ):
+     """Per-position K and V page pointers of one KV tile, from two scalars.
+ 
+@@ -226,9 +228,15 @@
+ 
+     for every position ``pos = tile_idx * TILE_SIZE + offs_t``, and the
+     block table is read at the same entries (the second one only when the
+-    tile crosses a block boundary).  Returns ``(physical_block_idx,
+-    slot_in_block, k_tok_ptr, v_tok_ptr)``; the first two feed the
+-    per-(token, head) scale caches.
++    tile crosses a block boundary).
++
++    ``V_CHUNKED``: V is stored ``[head][slot // TILE_SIZE][dim][slot % TILE_SIZE]``
++    inside the block (``V_CHUNK_STRIDE`` bytes per chunk of one tile), so the
++    PV dot's B operand is token-contiguous and a tile is one contiguous
++    chunk.  Needs ``BLOCK_SIZE % TILE_SIZE == 0`` (896 with 32-token tiles);
++    the head and dim strides are added by the caller as for the flat layout.  Returns
++    ``(physical_block_idx, slot_in_block, k_tok_ptr, v_tok_ptr)``; the first
++    two feed the per-(token, head) scale caches.
+     """
+     tl.static_assert(BLOCK_SIZE >= TILE_SIZE)
+     tile_start = tile_idx * TILE_SIZE
+@@ -241,11 +249,23 @@
+     k_page1 = key_cache_ptr + phys1.to(tl.int64) * stride_k_cache_0
+     v_page0 = value_cache_ptr + phys0.to(tl.int64) * stride_v_cache_0
+     v_page1 = value_cache_ptr + phys1.to(tl.int64) * stride_v_cache_0
+-    wrap = offs_t >= BLOCK_SIZE - rem0
+-    physical_block_idx = tl.where(wrap, phys1, phys0).to(tl.int64)
+-    slot_in_block = tl.where(wrap, rem0 - BLOCK_SIZE, rem0) + offs_t
+-    k_tok_ptr = tl.where(wrap, k_page1, k_page0) + slot_in_block * stride_k_cache_1.to(tl.int32)
+-    v_tok_ptr = tl.where(wrap, v_page1, v_page0) + slot_in_block * stride_v_cache_1.to(tl.int32)
++    if V_CHUNKED:
++        # Chunk-major V needs a block that is a whole number of tiles: a tile
++        # is then exactly one chunk, no tile crosses a block, and K and V are
++        # one page pointer per tile plus the position's own offset (the V
++        # offset is contiguous in the tile, which is what the PV dot's cp.async
++        # needs: adjacent lanes load adjacent bytes).
++        tl.static_assert(BLOCK_SIZE % TILE_SIZE == 0)
++        physical_block_idx = phys0.to(tl.int64)
++        slot_in_block = rem0 + offs_t
++        k_tok_ptr = k_page0 + slot_in_block * stride_k_cache_1.to(tl.int32)
++        v_tok_ptr = v_page0 + ((rem0 // TILE_SIZE) * V_CHUNK_STRIDE + offs_t)
++    else:
++        wrap = offs_t >= BLOCK_SIZE - rem0
++        physical_block_idx = tl.where(wrap, phys1, phys0).to(tl.int64)
++        slot_in_block = tl.where(wrap, rem0 - BLOCK_SIZE, rem0) + offs_t
++        k_tok_ptr = tl.where(wrap, k_page1, k_page0) + slot_in_block * stride_k_cache_1.to(tl.int32)
++        v_tok_ptr = tl.where(wrap, v_page1, v_page0) + slot_in_block * stride_v_cache_1.to(tl.int32)
+     return physical_block_idx, slot_in_block, k_tok_ptr, v_tok_ptr
+ 
+ 
+@@ -365,6 +385,7 @@
+     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+     FP8_FULL_CAUSAL: tl.constexpr = False,
+     FP8_FLAT_PHASE: tl.constexpr = -1,
++    V_CHUNKED: tl.constexpr = False,
+ ):
+     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
+     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
+@@ -376,7 +397,7 @@
+         tl.static_assert(KV_QUANT_MODE == 1 and Q_IS_FP8)
+         tl.static_assert(num_query_heads == 24 and num_queries_per_kv == 6)
+         tl.static_assert(HEAD_SIZE == 256 and HEAD_SIZE_PADDED == 256)
+-        tl.static_assert(BLOCK_SIZE == 880 and TILE_SIZE == 32)
++        tl.static_assert((BLOCK_SIZE == 880 or BLOCK_SIZE == 896) and TILE_SIZE == 32)
+         tl.static_assert(BLOCK_M == 16 and BLOCK_Q == 2)
+         tl.static_assert(USE_CAUSAL and not USE_PER_SEQ_CAUSAL)
+         tl.static_assert(not USE_MM_PREFIX and not USE_R_SWA)
+@@ -392,6 +413,10 @@
+             BLOCK_SIZE % TILE_SIZE == 0,
+             "USE_TD requires BLOCK_SIZE to be a multiple of TILE_SIZE",
+         )
++
++    if V_CHUNKED:
++        tl.static_assert(not USE_TD, "V_CHUNKED addresses V itself; no tensor descriptors")
++        tl.static_assert(stride_v_cache_3 == TILE_SIZE, "V_CHUNKED: the head dim is one tile of slots apart")
+ 
+     q_block_global_idx = tl.program_id(0)
+     kv_head_idx = tl.program_id(1)
+@@ -574,9 +599,28 @@
+             seq_offset = j * TILE_SIZE + offs_t
+             tile_mask = tl.full((TILE_SIZE,), True, tl.int1)
+ 
+-            physical_block_idx = tl.load(
+-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+-            ).to(tl.int64)
++            # Paged addressing resolved once per tile from two scalars; the
++            # addressed bytes are identical (see _paged_tile_ptrs).
++            (
++                physical_block_idx,
++                slot_in_block,
++                k_tok_ptr,
++                v_tok_ptr,
++            ) = _paged_tile_ptrs(
++                block_tables_ptr + block_table_offset,
++                key_cache_ptr,
++                value_cache_ptr,
++                j,
++                offs_t,
++                stride_k_cache_0,
++                stride_k_cache_1,
++                stride_v_cache_0,
++                stride_v_cache_1,
++                BLOCK_SIZE,
++                TILE_SIZE,
++                V_CHUNKED,
++                HEAD_SIZE * TILE_SIZE,
++            )
+ 
+             if USE_TD:
+                 # All TILE_SIZE slots within a single KV tile map to one
+@@ -618,27 +662,27 @@
+                     HEAD_SIZE_PADDED,
+                 )
+             else:
+-                v_offset = (
+-                    physical_block_idx[:, None] * stride_v_cache_0
+-                    + kv_head_idx * stride_v_cache_2
++                # In-block (head, dim) offsets are 32-bit; the page pointer
++                # carries the 64-bit part.
++                v_ptrs = (
++                    v_tok_ptr[:, None]
++                    + (kv_head_idx * stride_v_cache_2).to(tl.int32)
+                     + offs_d[None, :] * stride_v_cache_3
+-                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+-                )
+-                k_offset = (
+-                    physical_block_idx[None, :] * stride_k_cache_0
+-                    + kv_head_idx * stride_k_cache_2
++                )
++                k_ptrs = (
++                    k_tok_ptr[None, :]
++                    + (kv_head_idx * stride_k_cache_2).to(tl.int32)
+                     + offs_d[:, None] * stride_k_cache_3
+-                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                 )
+                 # K : (HEAD_SIZE, TILE_SIZE)
+                 K_load = tl.load(
+-                    key_cache_ptr + k_offset,
++                    k_ptrs,
+                     mask=dim_mask[:, None] & tile_mask[None, :],
+                     other=0.0,
+                 )
+                 # V : (TILE_SIZE, HEAD_SIZE)
+                 V_load = tl.load(
+-                    value_cache_ptr + v_offset,
++                    v_ptrs,
+                     mask=dim_mask[None, :] & tile_mask[:, None],
+                     other=0.0,
+                 )
+@@ -649,7 +693,7 @@
+             if USE_PER_TOKEN_HEAD_SCALES:
+                 scale_idx = (
+                     physical_block_idx * stride_ks_blk
+-                    + (seq_offset % BLOCK_SIZE) * stride_ks_slot
++                    + slot_in_block * stride_ks_slot
+                     + kv_head_idx * stride_ks_head
+                 )
+                 k_token_head_scales = tl.load(
+@@ -657,7 +701,7 @@
+                 )
+                 v_scale_idx = (
+                     physical_block_idx * stride_vs_blk
+-                    + (seq_offset % BLOCK_SIZE) * stride_vs_slot
++                    + slot_in_block * stride_vs_slot
+                     + kv_head_idx * stride_vs_head
+                 )
+                 v_token_head_scales = tl.load(
+@@ -720,9 +764,28 @@
+             seq_offset = j * TILE_SIZE + offs_t
+             tile_mask = seq_offset < max_seq_prefix_len
+ 
+-            physical_block_idx = tl.load(
+-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+-            ).to(tl.int64)
++            # Paged addressing resolved once per tile from two scalars; the
++            # addressed bytes are identical (see _paged_tile_ptrs).
++            (
++                physical_block_idx,
++                slot_in_block,
++                k_tok_ptr,
++                v_tok_ptr,
++            ) = _paged_tile_ptrs(
++                block_tables_ptr + block_table_offset,
++                key_cache_ptr,
++                value_cache_ptr,
++                j,
++                offs_t,
++                stride_k_cache_0,
++                stride_k_cache_1,
++                stride_v_cache_0,
++                stride_v_cache_1,
++                BLOCK_SIZE,
++                TILE_SIZE,
++                V_CHUNKED,
++                HEAD_SIZE * TILE_SIZE,
++            )
+ 
+             if USE_TD:
+                 # All TILE_SIZE slots within a single KV tile map to one
+@@ -764,27 +827,27 @@
+                     HEAD_SIZE_PADDED,
+                 )
+             else:
+-                v_offset = (
+-                    physical_block_idx[:, None] * stride_v_cache_0
+-                    + kv_head_idx * stride_v_cache_2
++                # In-block (head, dim) offsets are 32-bit; the page pointer
++                # carries the 64-bit part.
++                v_ptrs = (
++                    v_tok_ptr[:, None]
++                    + (kv_head_idx * stride_v_cache_2).to(tl.int32)
+                     + offs_d[None, :] * stride_v_cache_3
+-                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+-                )
+-                k_offset = (
+-                    physical_block_idx[None, :] * stride_k_cache_0
+-                    + kv_head_idx * stride_k_cache_2
++                )
++                k_ptrs = (
++                    k_tok_ptr[None, :]
++                    + (kv_head_idx * stride_k_cache_2).to(tl.int32)
+                     + offs_d[:, None] * stride_k_cache_3
+-                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                 )
+                 # K : (HEAD_SIZE, TILE_SIZE)
+                 K_load = tl.load(
+-                    key_cache_ptr + k_offset,
++                    k_ptrs,
+                     mask=dim_mask[:, None] & tile_mask[None, :],
+                     other=0.0,
+                 )
+                 # V : (TILE_SIZE, HEAD_SIZE)
+                 V_load = tl.load(
+-                    value_cache_ptr + v_offset,
++                    v_ptrs,
+                     mask=dim_mask[None, :] & tile_mask[:, None],
+                     other=0.0,
+                 )
+@@ -795,7 +858,7 @@
+             if USE_PER_TOKEN_HEAD_SCALES:
+                 scale_idx = (
+                     physical_block_idx * stride_ks_blk
+-                    + (seq_offset % BLOCK_SIZE) * stride_ks_slot
++                    + slot_in_block * stride_ks_slot
+                     + kv_head_idx * stride_ks_head
+                 )
+                 k_token_head_scales = tl.load(
+@@ -803,7 +866,7 @@
+                 )
+                 v_scale_idx = (
+                     physical_block_idx * stride_vs_blk
+-                    + (seq_offset % BLOCK_SIZE) * stride_vs_slot
++                    + slot_in_block * stride_vs_slot
+                     + kv_head_idx * stride_vs_head
+                 )
+                 v_token_head_scales = tl.load(
+@@ -882,9 +945,12 @@
+             else:
+                 acc += tl.dot(P.to(V.dtype), V)
+     else:
+-        for j in range(loop_lo, loop_hi):
++        # Tiles entirely below max_seq_prefix_len read unmasked; only the
++        # sequence's last tile can be partial and keeps the exact masks.
++        full_hi = tl.maximum(loop_lo, tl.minimum(loop_hi, max_seq_prefix_len // TILE_SIZE))
++        for j in range(loop_lo, full_hi):
+             seq_offset = j * TILE_SIZE + offs_t
+-            tile_mask = seq_offset < max_seq_prefix_len
++            tile_mask = tl.full((TILE_SIZE,), True, tl.int1)
+ 
+             # Paged addressing resolved once per tile from two scalars; the
+             # addressed bytes are identical (see _paged_tile_ptrs).
+@@ -905,6 +971,192 @@
+                 stride_v_cache_1,
+                 BLOCK_SIZE,
+                 TILE_SIZE,
++                V_CHUNKED,
++                HEAD_SIZE * TILE_SIZE,
++            )
++
++            if USE_TD:
++                # All TILE_SIZE slots within a single KV tile map to one
++                # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
++                # from the static_assert above), so load the block index as
++                # a scalar instead of a broadcast reduction.
++                offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
++                physical_block_scalar = tl.load(
++                    block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
++                ).to(tl.int64)
++                # K : (HEAD_SIZE, TILE_SIZE)
++                K_load = _load_kv_tile_td(
++                    key_cache_ptr,
++                    physical_block_scalar,
++                    kv_head_idx,
++                    offset_in_block,
++                    stride_k_cache_0,
++                    stride_k_cache_1,
++                    stride_k_cache_2,
++                    stride_k_cache_3,
++                    BLOCK_SIZE,
++                    TILE_SIZE,
++                    HEAD_SIZE,
++                    HEAD_SIZE_PADDED,
++                ).T
++                # V : (TILE_SIZE, HEAD_SIZE)
++                V_load = _load_kv_tile_td(
++                    value_cache_ptr,
++                    physical_block_scalar,
++                    kv_head_idx,
++                    offset_in_block,
++                    stride_v_cache_0,
++                    stride_v_cache_1,
++                    stride_v_cache_2,
++                    stride_v_cache_3,
++                    BLOCK_SIZE,
++                    TILE_SIZE,
++                    HEAD_SIZE,
++                    HEAD_SIZE_PADDED,
++                )
++            else:
++                # In-block (head, dim) offsets are 32-bit; the page pointer
++                # carries the 64-bit part.
++                v_ptrs = (
++                    v_tok_ptr[:, None]
++                    + (kv_head_idx * stride_v_cache_2).to(tl.int32)
++                    + offs_d[None, :] * stride_v_cache_3
++                )
++                k_ptrs = (
++                    k_tok_ptr[None, :]
++                    + (kv_head_idx * stride_k_cache_2).to(tl.int32)
++                    + offs_d[:, None] * stride_k_cache_3
++                )
++                # K : (HEAD_SIZE, TILE_SIZE)
++                K_load = tl.load(
++                    k_ptrs,
++                    mask=dim_mask[:, None] & tile_mask[None, :],
++                    other=0.0,
++                )
++                # V : (TILE_SIZE, HEAD_SIZE)
++                V_load = tl.load(
++                    v_ptrs,
++                    mask=dim_mask[None, :] & tile_mask[:, None],
++                    other=0.0,
++                )
++            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
++            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
++
++            # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
++            if USE_PER_TOKEN_HEAD_SCALES:
++                scale_idx = (
++                    physical_block_idx * stride_ks_blk
++                    + slot_in_block * stride_ks_slot
++                    + kv_head_idx * stride_ks_head
++                )
++                k_token_head_scales = tl.load(
++                    k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
++                )
++                v_scale_idx = (
++                    physical_block_idx * stride_vs_blk
++                    + slot_in_block * stride_vs_slot
++                    + kv_head_idx * stride_vs_head
++                )
++                v_token_head_scales = tl.load(
++                    v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
++                )
++
++            query_abs_pos = context_len + query_pos[:, None]
++            seq_mask = compute_kv_seq_mask(
++                query_abs_pos,
++                seq_offset,
++                seq_idx,
++                seq_len,
++                mm_prefix_range_ptr,
++                SLIDING_WINDOW,
++                USE_MM_PREFIX,
++                MAX_MM_RANGES,
++                USE_CAUSAL,
++                USE_PER_SEQ_CAUSAL,
++                per_seq_causal_ptr,
++                rswa_prefix_lens_ptr,
++                R_SWA_WINDOW,
++                USE_R_SWA,
++                CHUNK_LOOKBACK,
++                CHUNK_SIZE,
++                MM_PREFIX_CLAMP_SW,
++            )
++
++            # S : (BLOCK_M, TILE_SIZE)
++            S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
++            if USE_PER_TOKEN_HEAD_SCALES:
++                # Per-token-head quant: fuse softmax_scale with per-head k_scale
++                # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
++                S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
++            else:
++                S += score_scale * tl.dot(Q, K)
++
++            if USE_SOFTCAP:
++                S = apply_softcap(S, softcap)
++
++            S = tl.where(
++                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
++            )
++
++            if USE_ALIBI_SLOPES:
++                S = apply_alibi_to_score(
++                    S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
++                )
++
++            if USE_QQ_BIAS:
++                S += load_qq_bias_tile(
++                    qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
++                )
++
++            M, L, P, alpha = softmax_step(S, M, L)
++            acc = acc * alpha[:, None]
++
++            if SLIDING_WINDOW:
++                qpos_lo = q_block_local_idx * BLOCK_Q
++                dist = context_len + qpos_lo - seq_offset[:, None]
++                if USE_PER_SEQ_CAUSAL:
++                    is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
++                    sw_mask_v = tl.where(
++                        is_causal_seq,
++                        dist < SLIDING_WINDOW,
++                        (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
++                    )
++                elif USE_CAUSAL:
++                    sw_mask_v = dist < SLIDING_WINDOW
++                else:
++                    sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
++                V = tl.where(sw_mask_v, V, 0.0)
++            if USE_PER_TOKEN_HEAD_SCALES:
++                # Per-token-head quant: apply v_scale to P instead of V.
++                P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
++                acc += tl.dot(P_v, V)
++            else:
++                acc += tl.dot(P.to(V.dtype), V)
++        for j in range(full_hi, loop_hi):
++            seq_offset = j * TILE_SIZE + offs_t
++            tile_mask = seq_offset < max_seq_prefix_len
++
++            # Paged addressing resolved once per tile from two scalars; the
++            # addressed bytes are identical (see _paged_tile_ptrs).
++            (
++                physical_block_idx,
++                slot_in_block,
++                k_tok_ptr,
++                v_tok_ptr,
++            ) = _paged_tile_ptrs(
++                block_tables_ptr + block_table_offset,
++                key_cache_ptr,
++                value_cache_ptr,
++                j,
++                offs_t,
++                stride_k_cache_0,
++                stride_k_cache_1,
++                stride_v_cache_0,
++                stride_v_cache_1,
++                BLOCK_SIZE,
++                TILE_SIZE,
++                V_CHUNKED,
++                HEAD_SIZE * TILE_SIZE,
+             )
+ 
+             if USE_TD:
+@@ -1348,6 +1600,9 @@
+     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
+     # Default False keeps the original behavior for every other model.
+     mm_prefix_clamp_sliding_window: bool = False,
++    # V stored chunk-major inside the block (see _paged_tile_ptrs); the
++    # backend builds the matching cache views and sets this.
++    v_chunked: bool = False,
+ ):
+     # Resolve causal: bool or per-seq tensor.
+     use_per_seq_causal = isinstance(causal, torch.Tensor)
+@@ -1632,7 +1887,7 @@
+         and v.dtype == torch.float8_e4m3fn
+         and out.dtype == torch.bfloat16
+         and num_query_heads == 24 and num_kv_heads == 4 and head_size == 256
+-        and block_size == 880 and BLOCK_M == 16 and BLOCK_Q == 2
++        and block_size in (880, 896) and BLOCK_M == 16 and BLOCK_Q == 2
+         and tile_size == 32 and 1 <= num_seqs <= 4 and max_seqlen_q > 1
+         and use_causal and not use_per_seq_causal
+         and sliding_window_val == 0 and chunk_lookback < 0
+@@ -1644,8 +1899,8 @@
+ 
+     if _fp8_full_causal:
+         logger.info_once(
+-            "SYV_FP8_CAUSAL_FULL path=2D block=880 q_heads=24 maxq=%d",
+-            max_seqlen_q, scope="process",
++            "SYV_FP8_CAUSAL_FULL path=2D block=%d q_heads=24 maxq=%d",
++            block_size, max_seqlen_q, scope="process",
+         )
+ 
+     _fp8_flat_prefill = (
+@@ -1736,6 +1991,7 @@
+             USE_TD=use_td,
+             USE_TD_QO=use_td_qo,
+             MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
++            V_CHUNKED=v_chunked,
+             **launch_kwargs,
+         )
+ 
+--- a/v1/attention/ops/triton_reshape_and_cache_flash.py
++++ b/v1/attention/ops/triton_reshape_and_cache_flash.py
+@@ -56,6 +56,11 @@
+     FP8_KV_CACHE: tl.constexpr,
+     # tune parameters
+     TILE_SIZE: tl.constexpr,
++    # V stored [Block, Head, Slot // 32, Dim, Slot % 32] (chunk-major); K keeps
++    # the flash layout.  Strides of the value cache view: block and head.
++    block_stride_v: tl.int64 = 0,
++    head_stride_v: tl.int64 = 0,
++    V_CHUNKED: tl.constexpr = False,
+ ):
+     token_idx = tl.program_id(axis=0)
+     slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
+@@ -100,7 +105,17 @@
+             + cur_head * head_stride
+             + cur_dim
+         )
+-        tgt_idx_v = tgt_idx_k
++        if V_CHUNKED:
++            # Value addressing: [Block, Head, Slot // 32, Dim, Slot % 32]
++            tgt_idx_v = (
++                block_idx * block_stride_v
++                + cur_head * head_stride_v
++                + (block_offset // 32) * (head_size * 32)
++                + cur_dim * 32
++                + block_offset % 32
++            )
++        else:
++            tgt_idx_v = tgt_idx_k
+ 
+     # [TILE_SIZE]
+     key_load = tl.load(
+@@ -371,11 +386,22 @@
+     kv_cache_dtype: str,  # "auto", "fp8"
+     k_scale: torch.Tensor,  # float32
+     v_scale: torch.Tensor,  # float32
++    v_chunked: bool = False,  # value_cache is the [B, H, N // 32, hs, 32] view
+ ):
+     num_heads = key.shape[1]
+     head_size = key.shape[2]
+ 
+     use_head_major_layout = key_cache.ndim == 5
++    if v_chunked:
++        assert not use_head_major_layout
++        assert value_cache.ndim == 5 and value_cache.shape[3] == head_size
++        assert value_cache.shape[4] == 32 and value_cache.stride(4) == 1
++        assert value_cache.stride(3) == 32 and value_cache.stride(2) == head_size * 32
++        block_stride_v = value_cache.stride(0)
++        head_stride_v = value_cache.stride(1)
++    else:
++        block_stride_v = 0
++        head_stride_v = 0
+     if use_head_major_layout:
+         block_size = key_cache.shape[3]
+         x = key_cache.shape[4]
+@@ -455,6 +481,9 @@
+         FP8_KV_CACHE=FP8_KV_CACHE,
+         # autotune parameters
+         TILE_SIZE=TILE_SIZE,
++        block_stride_v=block_stride_v,
++        head_stride_v=head_stride_v,
++        V_CHUNKED=v_chunked,
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -66,7 +66,7 @@
+         and envs.VLLM_TRITON_FP8_MQ3D
+         and kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+         and num_heads_q == 24 and num_heads_kv == 4 and headdim == 256
+-        and block_size == 880
++        and block_size in (880, 896)
+         and current_platform.is_device_capability(89)
+     ):
+         return 32
+@@ -685,6 +685,20 @@
+ 
+         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
++        # FP8 per-tensor decoder layers of the target's shape only: V stored
++        # chunk-major (one 32-token tile per chunk) inside each block so the
++        # PV dot's B operand is token-contiguous.  The block's bytes are
++        # re-assigned privately to this backend (writer and reader below);
++        # the page size and count do not change.  Needs a block of whole
++        # tiles (--block-size 896), checked where the views are built.
++        self._fp8_v_chunked = bool(
++            envs.VLLM_TRITON_FP8_V_CHUNKED
++            and self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
++            and attn_type == AttentionType.DECODER
++            and self.sliding_window == (-1, -1)
++            and self.num_kv_heads == 4 and self.head_size == 256
++        )
++        self._fp8_v_views: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+ 
+         # Enable tensor descriptors for Q/K/V load/store on platforms that
+         # benefit from HW 2D block reads (Intel XPU).  The dead branch
+@@ -771,6 +785,19 @@
+             v_scale_cache = self._v_scale_cache
+             q_descale = k_descale = v_descale = None
+         # FP8 per-tensor / auto path (original flow).
++        elif self._fp8_v_chunked:
++            key_cache, value_cache, _ = self._fp8_chunked_caches(kv_cache)
++            descale_shape = (
++                attn_metadata.query_start_loc.shape[0] - 1,
++                key_cache.shape[2],
++            )
++            q_descale = (
++                layer._q_scale if query.dtype == self.fp8_dtype else None
++            )
++            k_descale = layer._k_scale.expand(descale_shape)
++            v_descale = layer._v_scale.expand(descale_shape)
++            k_scale_cache = None
++            v_scale_cache = None
+         else:
+             kv_cache = kv_cache.transpose(1, 2)
+             hs = self.head_size
+@@ -868,6 +895,7 @@
+             mm_prefix_clamp_sliding_window=getattr(
+                 layer, "mm_prefix_clamp_sliding_window", False
+             ),
++            v_chunked=self._fp8_v_chunked,
+         )
+ 
+         return output
+@@ -907,7 +935,63 @@
+                 k_scale_cache=None, v_scale_cache=None,
+                 chunk_lookback=self.chunk_lookback, use_td=False,
+                 mm_prefix_clamp_sliding_window=False,
+-            )
++                v_chunked=self._fp8_v_chunked,
++            )
++
++    def _fp8_chunked_caches(
++        self, kv_cache: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """K and V views over the layer's block-compact pages with V chunk-major.
++
++        ``kv_cache`` is the logical ``[B, H, N, 2 * hs]`` view.  Each block's
++        bytes are re-assigned as K ``[N, H, hs]`` followed by V
++        ``[H, N // 32, hs, 32]``.  Returns ``(key_cache, value_attn,
++        value_write)``: the key view ``[B, N, H, hs]``; the value view the
++        attention wrapper reads block_size and strides from, ``[B, N, H, hs]``
++        with strides ``(block, 1, N * hs, 32)`` (the kernel adds the chunk
++        offsets itself); and the ``[B, H, N // 32, hs, 32]`` view the writer fills.
++        Built once per layer cache and memoised.
++        """
++        views = self._fp8_v_views.get(kv_cache.data_ptr())
++        if views is None:
++            num_blocks, nkv, block_size, content = kv_cache.shape
++            hs = self.head_size
++            assert content == 2 * hs
++            assert block_size % 32 == 0, (
++                "chunk-major V needs a block of whole 32-token tiles (--block-size 896)"
++            )
++            block_stride = kv_cache.stride(0)
++            assert block_stride == nkv * block_size * content, (
++                "chunk-major V needs block-compact pages"
++            )
++            raw = (
++                kv_cache.view(self.fp8_dtype)
++                if kv_cache.dtype != self.fp8_dtype
++                else kv_cache
++            )
++            flat = torch.empty(0, dtype=self.fp8_dtype, device=kv_cache.device)
++            flat.set_(raw.untyped_storage())
++            base = raw.storage_offset()
++            k_bytes = block_size * nkv * hs
++            key_cache = torch.as_strided(
++                flat, (num_blocks, block_size, nkv, hs),
++                (block_stride, nkv * hs, hs, 1), base,
++            )
++            # The wrapper reads block_size from v.shape[1] and the strides from
++            # v.stride(); the kernel adds the chunk offsets itself, so this
++            # view only has to carry the block, head and dim strides and the
++            # slot stride 1 (it overlaps within a chunk and is never written).
++            value_attn = torch.as_strided(
++                flat, (num_blocks, block_size, nkv, hs),
++                (block_stride, 1, block_size * hs, 32), base + k_bytes,
++            )
++            value_write = torch.as_strided(
++                flat, (num_blocks, nkv, block_size // 32, hs, 32),
++                (block_stride, block_size * hs, hs * 32, 32, 1), base + k_bytes,
++            )
++            views = (key_cache, value_attn, value_write)
++            self._fp8_v_views[kv_cache.data_ptr()] = views
++        return views
+ 
+     def _pth_key_value_caches(
+         self, kv_cache: torch.Tensor
+@@ -996,12 +1080,17 @@
+                 kv_quant_mode=self._kv_quant_mode,
+             )
+             return
+-        # For decoder and cross-attention, use KV cache as before.
+-        # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
+-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+-        if is_quantized_kv_cache(self.kv_cache_dtype):
+-            key_cache = key_cache.view(self.fp8_dtype)
+-            value_cache = value_cache.view(self.fp8_dtype)
++        if self._fp8_v_chunked:
++            key_cache, _, value_cache = self._fp8_chunked_caches(kv_cache)
++        else:
++            # For decoder and cross-attention, use KV cache as before.
++            # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
++            key_cache, value_cache = kv_cache.transpose(1, 2).split(
++                self.head_size, dim=-1
++            )
++            if is_quantized_kv_cache(self.kv_cache_dtype):
++                key_cache = key_cache.view(self.fp8_dtype)
++                value_cache = value_cache.view(self.fp8_dtype)
+         triton_reshape_and_cache_flash(
+             key,
+             value,
+@@ -1011,6 +1100,7 @@
+             self.kv_cache_dtype,
+             layer._k_scale,
+             layer._v_scale,
++            v_chunked=self._fp8_v_chunked,
+         )
+ 
+     def fused_rope_kvcache_supported(self):
+@@ -1030,6 +1120,7 @@
+         kv_cache: torch.Tensor,
+         layer_slot_mapping: torch.Tensor,
+     ):
++        assert not self._fp8_v_chunked, "chunk-major V has no fused rope+cache path"
+         # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
+         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+         flash_layout = True
+--- a/envs.py
++++ b/envs.py
+@@ -1589,6 +1589,7 @@
+     "VLLM_TRITON_FP8_CAUSAL_FULL": lambda: bool(int(os.environ.get("VLLM_TRITON_FP8_CAUSAL_FULL", "0"))),
+     "VLLM_TRITON_FP8_PREFILL_FLAT": lambda: {"0": 0, "1": 1}[os.environ.get("VLLM_TRITON_FP8_PREFILL_FLAT", "0")],
+     "VLLM_TRITON_FP8_MQ3D_SEGMENTS": lambda: int(os.environ.get("VLLM_TRITON_FP8_MQ3D_SEGMENTS", "16")),
++    "VLLM_TRITON_FP8_V_CHUNKED": lambda: bool(int(os.environ.get("VLLM_TRITON_FP8_V_CHUNKED", "0"))),
+     "VLLM_TRITON_FP8_MQ3D": lambda: bool(
+         int(os.environ.get("VLLM_TRITON_FP8_MQ3D", "0"))
+     ),

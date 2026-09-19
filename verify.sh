@@ -1,12 +1,14 @@
 #!/bin/bash
 # Check that this repo is installed the way the README numbers assume:
-# venv + vLLM version, every compatible patch applied, the model requantized (lm_head,
+# venv + vLLM version, every compatible patch applied, the FP8 attention steps and
+# the GGUF plugin installed, the model requantized (lm_head,
 # embed_tokens, MTP module, draft head), keys/files present, and — if a
 # server is running — that it answers and which backend/pool it came up with.
 #
 #   bash verify.sh            # everything
 #   bash verify.sh --no-server
-#   bash verify.sh --install  # only the install (venv, vLLM, patches, KVarN): no GPU,
+#   bash verify.sh --install  # only the install (venv, vLLM, patches, KVarN, fp8/,
+#                             # gguf-plugin/): no GPU,
 #                             # model or server checks — what the Docker build runs
 # Exit code: 0 all PASS (WARNs allowed), 1 if anything FAILs.
 # PY=/path/to/python overrides the interpreter (default: this repo's venv).
@@ -15,6 +17,8 @@ cd "$HERE"
 NOSRV=0; INSTALL=0
 for a in "$@"; do case "$a" in --no-server) NOSRV=1;; --install) INSTALL=1; NOSRV=1;; esac; done
 FAILS=0
+# Where fp8/install.sh put its archives; fp8/install.sh reads the same variable.
+FP8_ARCHIVE=${FP8_ARCHIVE:-/opt/fp8}
 ok()   { printf "  PASS  %s\n" "$1"; }
 warn() { printf "  WARN  %s\n" "$1"; }
 fail() { printf "  FAIL  %s\n" "$1"; FAILS=$((FAILS+1)); }
@@ -98,8 +102,118 @@ if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
   else warn "kvarn-v2-runner-0.29.0.patch not applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
 else warn "KVarN not installed (optional; bash kvarn/install.sh for 262k context)"; fi
 
+echo "== FP8 Triton attention (fp8/)"
+# What this repo carries, checked the same way gguf-plugin/ is. This is about the
+# files in the checkout, so it runs whether or not anything was installed.
+( cd fp8 && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
+  && ok "fp8/ generators, gates and patches match SHA256SUMS" \
+  || fail "fp8/SHA256SUMS does not match the files in the repo"
+
+# Is fp8 installed at all? Everything below distinguishes "not installed", which
+# is allowed, from "installed and drifted", which is not. The Docker build always
+# installs it; a venv install may not have.
+FP8_INSTALLED=0
+[ -f "$FP8_ARCHIVE/composite/manifest.json" ] && FP8_INSTALLED=1
+$PY -c "import vllm.envs as e, sys; sys.exit(0 if 'VLLM_TRITON_FP8_V_CHUNKED' in e.environment_variables else 1)" 2>/dev/null \
+  && FP8_IN_TREE=1 || FP8_IN_TREE=0
+
+if [ $FP8_INSTALLED = 1 ]; then
+  if ( cd fp8/fp8-composite && $PY -B install_composite.py --verify-seal \
+         --archive "$FP8_ARCHIVE/composite" \
+         --causal-archive "$FP8_ARCHIVE/causal" >/dev/null 2>&1 ); then
+    ok "fp8-causal r1+r2 and fp8-composite installed, seal re-derives from its archived parents"
+  else fail "fp8 seal does not re-derive from $FP8_ARCHIVE (the archive and the installers disagree)"; fi
+elif [ $FP8_IN_TREE = 1 ]; then
+  warn "fp8 steps are in the vLLM tree but $FP8_ARCHIVE holds no manifest (FP8_ARCHIVE set elsewhere?)"
+else
+  warn "fp8 not installed (optional; bash fp8/install.sh for CTX=fp8 / KV=fp8triton)"
+fi
+
+# The tree, independently of the archive: the seal deliberately does not look at
+# the live files, because fp8-paged rewrites three of the four after it was
+# published. This is what says the tree is still what the last step left behind,
+# and it needs nothing but $SP -- so a drifted image cannot hide behind a missing
+# archive.
+if [ $FP8_IN_TREE = 1 ]; then
+  $PY - "$SP" fp8/fp8-paged/PINS <<'EOF' && ok "the four files fp8-paged touches match fp8-paged/PINS" || fail "the vLLM tree does not match fp8-paged/PINS (reinstall from a clean tree)"
+import hashlib, pathlib, sys
+sp, pins = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+want = {}
+for line in pins.read_text(encoding="utf8").splitlines():
+    if line.startswith("v-chunked.after"):
+        _, rel, digest = line.split()
+        want[rel] = digest
+if not want:
+    sys.exit(1)
+for rel, digest in want.items():
+    if hashlib.sha256((sp / rel).read_bytes()).hexdigest() != digest:
+        sys.exit(1)
+EOF
+  # helpers is the one composite file fp8-paged leaves alone, so PINS above says
+  # nothing about it. Its pin lives in the generator that read it.
+  $PY - "$SP" <<'EOF' && ok "triton_attention_helpers.py matches the pin the generators read it under" || fail "triton_attention_helpers.py is not the file fp8/ was cut against"
+import hashlib, importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location(
+    "seg", "fp8/fp8-composite/decode_z/install_decode_segments.py")
+seg = importlib.util.module_from_spec(spec); spec.loader.exec_module(seg)
+data = (pathlib.Path(sys.argv[1]) / seg.FILES["helpers"]).read_bytes()
+sys.exit(0 if hashlib.sha256(data).hexdigest() == seg.PINS["helpers"] else 1)
+EOF
+  # Registration, not behaviour: this says the names exist and default off, which
+  # is what makes setting them meaningful. Nothing in this repo establishes that
+  # any of them changes a kernel's output -- fp8/README.md says so plainly.
+  $PY - <<'EOF' && ok "seven FP8 attention flags registered in envs.py, all at their off default" || fail "the FP8 attention flags are not registered, or one does not default to off"
+import sys
+import vllm.envs as e
+want = ("VLLM_TRITON_FP8_CAUSAL_FULL", "VLLM_TRITON_FP8_PREFILL_FLAT", "VLLM_TRITON_FP8_MQ3D",
+        "VLLM_TRITON_FP8_MQ3D_MIXED_TARGET", "VLLM_TRITON_FP8_MQ3D_QMAX",
+        "VLLM_TRITON_FP8_MQ3D_SEGMENTS", "VLLM_TRITON_FP8_V_CHUNKED")
+if not all(n in e.environment_variables for n in want):
+    sys.exit(1)
+sys.exit(0 if (e.VLLM_TRITON_FP8_CAUSAL_FULL is False and e.VLLM_TRITON_FP8_PREFILL_FLAT == 0
+               and e.VLLM_TRITON_FP8_MQ3D is False and e.VLLM_TRITON_FP8_MQ3D_SEGMENTS == 16
+               and e.VLLM_TRITON_FP8_V_CHUNKED is False) else 1)
+EOF
+fi
+
+echo "== GGUF plugin (gguf-plugin/)"
+# Installed as a package, not patched into vllm: check the package, its compiled
+# extension and the one function that decides whether it claims a model at all.
+if $PY -c "import vllm_gguf_plugin" >/dev/null 2>&1; then
+  ROOT=$($PY -c "import vllm_gguf_plugin, os; print(os.path.dirname(vllm_gguf_plugin.__file__))" 2>/dev/null | tail -n1)
+  ls "$ROOT"/_C_gguf*.so >/dev/null 2>&1 \
+    && ok "vllm_gguf_plugin importable with its compiled extension" \
+    || fail "vllm_gguf_plugin importable but _C_gguf*.so is missing (bash gguf-plugin/install.sh)"
+  $PY - <<'EOF' && ok "plugin claims .gguf models only (self-detecting)" || fail "the plugin's model test does not read as expected"
+import inspect, sys
+from vllm_gguf_plugin import loader
+src = inspect.getsource(loader._is_gguf_model)
+sys.exit(0 if '.gguf' in src and 'is_gguf' in src else 1)
+EOF
+  ( cd gguf-plugin && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
+    && ok "gguf-plugin/ patches and Gluon modules match SHA256SUMS" \
+    || fail "gguf-plugin/SHA256SUMS does not match the files in the repo"
+else warn "GGUF plugin not installed (optional; bash gguf-plugin/install.sh to serve a .gguf model)"; fi
+
 if [ $INSTALL = 0 ]; then
 echo "== model at $MODEL"
+case "$MODEL" in *.gguf)
+  # GGUF weights are one file, not a checkpoint directory, and everything the
+  # section below reads -- config.json, the safetensors index, the per-tensor
+  # quantization geometry -- lives inside the file instead. The plugin reads it;
+  # what this can say is that the file and the tokenizer the launcher will pass
+  # beside it are there.
+  [ -f "$MODEL" ] && ok "GGUF weights present ($(basename "$MODEL"))" || fail "GGUF weights not found at $MODEL"
+  GD=$(dirname "$MODEL"); GC=$GD; [ -d "$GD/hfconfig" ] && GC=$GD/hfconfig
+  # WARN, not FAIL: the launcher passes $GC as --tokenizer and --hf-config-path,
+  # and vLLM says clearly what it could not read. Refusing to boot here would
+  # also refuse a layout that works and this check does not know about.
+  [ -f "$GC/tokenizer.json" ] && ok "tokenizer beside the GGUF ($GC)" \
+    || warn "no tokenizer.json in $GC; the launcher passes that path as --tokenizer"
+  [ -f "$GC/config.json" ] && ok "HF config beside the GGUF ($GC)" \
+    || warn "no config.json in $GC; the launcher passes that path as --hf-config-path"
+  ;;
+*)
 if [ ! -f "$MODEL/config.json" ]; then fail "model not found (README Setup: hf download)"; else
 $PY - "$MODEL" <<'EOF'
 import json, os, sys
@@ -172,6 +286,8 @@ sys.exit(1 if F else 0)
 EOF
 [ $? -ne 0 ] && FAILS=$((FAILS+1))
 fi
+  ;;
+esac
 
 echo "== single-user fast variant (optional)"
 if [ -d "$HERE/models/Qwen3.8-27B-W4A16-AutoRound-fast" ]; then ok "fast variant present (int4-GPTQ lm_head/MTP, own-output draft vocab)"; else warn "no models/Qwen3.8-27B-W4A16-AutoRound-fast (venv/bin/python prepare/fetch_fast_variant.py; single-user mode is ~15% slower without it)"; fi

@@ -28,15 +28,17 @@ Docker Desktop with WSL2, leave `VLLM_WSL2_ENABLE_PIN_MEMORY=1` enabled; it is
 required by the V2 runner before model loading begins. The detailed failure
 signature and other WSL2 workarounds are below.
 
-**The image is prebuilt**: every push to `main` builds and pushes
-`ghcr.io/syv-ai/hyperqwen:latest` (plus an immutable `sha-<7>` tag
-per commit) from CI, with the Dockerfile's own patch application and
-`verify.sh --install` as the gate — a patch that stops applying fails the
-build and nothing is pushed. The first `up` pulls it (~9.5 GB,
-`pull_policy: missing`); to pin a known
-build, set `image: ghcr.io/syv-ai/hyperqwen:sha-<7>` in a compose
-override. Building locally instead still works — `docker compose build` (or
-`up --build`) produces the identical image (~20 minutes) — and the `prepare` service downloads
+**The image is built here, not pulled.** `pull_policy: build` and the local tag
+`hyperqwen-rtx4080s32:local`: this tree's image is upstream's plus the FP8
+attention steps of `fp8/` and the GGUF plugin of `gguf-plugin/`, so upstream's
+prebuilt `ghcr.io/syv-ai/hyperqwen:latest` is a different stack under a name
+that looks like this one, and none of the numbers in `docs/reproductions/` were
+measured on it. `docker compose up` builds when the context changed and reuses
+the layer cache when it did not; the Dockerfile's own patch application,
+`fp8/install.sh`, `gguf-plugin/install.sh` and `verify.sh --install` are the
+gate, so a patch or a pin that stops applying fails the build by name. The
+longest step after the wheels is the GGUF plugin, which compiles its CUDA
+extension for sm_89 and sm_120. The `prepare` service downloads
 the model into `./models` and runs the same requantization scripts as above
 (CPU only, idempotent, ~20 GB + a few minutes; `FAST_VARIANT=0` in `.env`
 skips the ~1 GB fast-variant download), then the server starts. The first
@@ -101,9 +103,10 @@ separate `prepare` service, nothing the image needs. The same server, one
 command, no checkout:
 
 ```bash
+docker compose build                      # hyperqwen-rtx4080s32:local
 docker run -d --name qwen --gpus all --ipc=host -p 18020:18020 \
   -v qwen-models:/app/models -v qwen-cache:/cache \
-  --restart unless-stopped ghcr.io/syv-ai/hyperqwen:latest
+  --restart unless-stopped hyperqwen-rtx4080s32:local
 ```
 
 - The entrypoint runs the same idempotent `prepare` before serving, so the
@@ -113,6 +116,7 @@ docker run -d --name qwen --gpus all --ipc=host -p 18020:18020 \
   at a time — `docker rm -f qwen` first).
 - Knobs that compose forwards from `.env` become `-e` flags:
   `-e VLLM_API_KEY=...`, `-e SPEC=dflash2 -e PREFIX_CACHE=1`,
+  `-e CTX=fp8` for the FP8 attention set (`fp8/README.md`),
   `-e GPU_UTIL=0.93` on WSL2, `-e EXTRA_ARGS=...`.
 - To share one model download with a venv install or a compose checkout,
   bind-mount that directory instead of the named volume:

@@ -8,7 +8,19 @@
 # Knobs go in a .env file next to this file (never committed): VLLM_API_KEY=...,
 # and any of the start-script variables (CTX, KV, MAX_LEN, MAX_SEQS, GPU_UTIL, VISION,
 # SPEC_ATTN, DRAFT_TOKENS, EXTRA_ARGS, ...) — .env is passed straight into the
-# container. Fastest single-user decode, if the card is yours alone (README,
+# container.
+#
+# The FP8 Triton attention set that fp8/ installs (fp8/README.md) is one value:
+#
+#   printf 'CTX=fp8\nSPEC=dflash2\nDFLASH_TOKENS=7\n' >> .env     # single
+#   printf 'KV=fp8triton\n' >> .env                              # batch
+#
+# Both turn on the seven VLLM_TRITON_FP8_* flags together; setting any of them
+# in .env yourself keeps your value. FP8_KERNELS=0 turns the set back off while
+# keeping the geometry. A MODEL= path ending in .gguf additionally routes the
+# weights through the plugin in gguf-plugin/, which needs nothing else set.
+#
+# Fastest single-user decode, if the card is yours alone (README,
 # "If you are the only user"; the drafter it needs is already downloaded by
 # prepare):
 #
@@ -42,14 +54,15 @@
 # (README, "More than one GPU"; docs/gotchas.md 48).
 
 x-qwen: &qwen
-  # Prebuilt on every main push by .github/workflows/docker-image.yml; the
-  # first `up` pulls it (~9.5 GB, pull_policy below) instead of the 20-minute
-  # local build. `docker compose build` (or `up --build`) still builds the
-  # identical image under the same tag name. Immutable per-commit tags:
-  # ghcr.io/syv-ai/hyperqwen:sha-<7>.
-  image: ghcr.io/syv-ai/hyperqwen:latest
+  # Built here, not pulled. This tree's image is upstream's plus the FP8
+  # attention steps of fp8/ and the GGUF plugin of gguf-plugin/, so the prebuilt
+  # ghcr.io/syv-ai/hyperqwen:latest is a different image under the same name:
+  # `pull_policy: missing` against it would serve a stack none of the numbers in
+  # docs/reproductions/ were measured on. `pull_policy: build` builds every time
+  # the context changed and reuses the layer cache when it did not.
+  image: hyperqwen-rtx4080s32:local
   build: .
-  pull_policy: missing
+  pull_policy: build
   ipc: host
   env_file:
     - path: .env

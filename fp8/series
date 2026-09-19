@@ -1,0 +1,11 @@
+# Apply order for fp8/install.sh. One name per line, comments and blank lines
+# ignored. Each step reads what the one before it wrote, so this order is not a
+# preference: fp8-causal-r2 rewrites the kernel fp8-causal left, fp8-composite
+# pins the kernel r2 left, and fp8-paged patches the kernel the composite left.
+#
+# Every step runs after patches/series and after kvarn/install.sh, because all
+# four of them pin the bytes of files those two touch.
+fp8-causal
+fp8-causal-r2
+fp8-composite
+fp8-paged

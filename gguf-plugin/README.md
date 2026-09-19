@@ -21,8 +21,11 @@ bash gguf-plugin/install.sh            # fetch, patch, build, install
 python3 gguf-plugin/test_gguf_rco_cpu.py
 ```
 
-It is **not** wired into the Dockerfile. Doing that is one line next to
-`kvarn/install.sh`.
+The Dockerfile runs it after `kvarn/install.sh` and `fp8/install.sh`, so every
+image built from this repo has the plugin. It costs build time -- the extension
+is compiled for two architectures -- and nothing at run time until a model path
+ends in `.gguf`: `_is_gguf_model()` is the whole of the plugin's claim on a
+model, and it reads the path.
 
 `TORCH_CUDA_ARCH_LIST` defaults to `8.9;12.0`. sm_89 is this card; sm_120 is
 there because SASS is not forward-compatible across generations and only PTX is,

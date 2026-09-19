@@ -53,9 +53,9 @@ cudagraph-memory-from-allocator.patch
 
 # --- Ada additions ------------------------------------------------------------
 # Everything above is upstream's series. Everything below is this fork's, applied
-# after it and re-cut against the tree upstream's series leaves behind. A donor
-# patch whose subject upstream already covers is not carried at all; PATCHES.md
-# names those and why.
+# after it and re-cut against the tree upstream's series leaves behind. A patch
+# whose subject upstream already covers is not carried at all; PATCHES.md names
+# those and why.
 gdn-spec-state-recovery-core.patch
 mamba-align-row-null-bounds.patch
 gdn-persistent-recovery-buffer.patch

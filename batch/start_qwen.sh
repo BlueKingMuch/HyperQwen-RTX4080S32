@@ -65,6 +65,11 @@ API_SERVERS=${API_SERVERS:-1}
 # KV=int4pth: vLLM's built-in int4 per-token-head KV cache on the Triton
 # attention backend: 262k context with no extra install, ~1.5x slower decode /
 # 2.3x slower prefill at 100k than fp8 (docs/long-context.md).
+# KV=fp8triton: the same fp8 KV dtype on the Triton attention backend instead of
+# FlashInfer, block size 896, with the four FP8 attention steps of fp8/ turned
+# on. Those steps are cut for this model's geometry (24 query heads, 4 KV heads,
+# head_dim 256) and apply on no other backend; single-user mode reaches the same
+# arm as CTX=fp8.
 KV=${KV:-fp8}
 if [ "$KV" = "int4pth" ]; then
   MAX_LEN=${MAX_LEN:-262144}
@@ -77,11 +82,26 @@ elif [ "$KV" = "kvarn" ]; then
   # fp16 staging pool for the tiles still being written: share of free memory
   # after weights; 0.25 keeps all 64 slots, smaller values cap max-num-seqs
   export KVARN_POOL_MEM_FRAC=${KVARN_POOL_MEM_FRAC:-0.25}
+elif [ "$KV" = "fp8triton" ]; then
+  # The same window as the other batch arms; what fp8 buys is the pool, not the
+  # window. See the note in single-user/start_qwen.sh for what the wider variant
+  # measured.
+  MAX_LEN=${MAX_LEN:-150000}
+  GPU_UTIL=${GPU_UTIL:-0.88}
+  MAX_BATCHED=${MAX_BATCHED:-2048}
+  KV_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype fp8_e4m3 --block-size ${BLOCK_SIZE:-896}"
 else
   MAX_LEN=${MAX_LEN:-150000}
   GPU_UTIL=${GPU_UTIL:-0.972}
   KV_ARGS="--kv-cache-dtype fp8"
 fi
+# FP8_KERNELS=1 is the default under KV=fp8triton and off everywhere else: the
+# four steps fp8/install.sh puts in the venv do nothing on any other backend.
+if [ "$KV" = "fp8triton" ]; then FP8_KERNELS=${FP8_KERNELS:-1}; else FP8_KERNELS=${FP8_KERNELS:-0}; fi
+source "$REPO/fp8/env.sh" \
+  || { echo "start_qwen: cannot source $REPO/fp8/env.sh - refusing to boot" >&2; exit 1; }
+resolve_fp8_kernels "$FP8_KERNELS"
+resolve_gguf_args "$MODEL"
 # int8 activations: "int8" (default) or empty for W4A16; layers: regex on the
 # layer name, "mlp" (default: gate_up_proj + down_proj) or "gate_up"
 INT8_ACT=${INT8_ACT-int8}
@@ -213,10 +233,11 @@ exec venv/bin/vllm serve "$MODEL" \
   --max-num-seqs $MAX_SEQS \
   --api-server-count $API_SERVERS \
   ${VISION_ARGS} \
+  "${GGUF_ARGS[@]}" \
   $KV_ARGS \
-  --mamba-ssm-cache-dtype float16 \
+  --mamba-ssm-cache-dtype ${MAMBA_SSM_DTYPE:-float16} \
   --async-scheduling \
-  --max-num-batched-tokens 2048 \
+  --max-num-batched-tokens ${MAX_BATCHED:-2048} \
   --compilation-config "{\"max_cudagraph_capture_size\":64,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]}" \
   --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
