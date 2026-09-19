@@ -90,10 +90,15 @@ def registry_proof(source):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--vllm-root',type=Path,required=True)
-    p.add_argument('--archive',type=Path,required=True)
+    # --archive is the installed step's own state directory. The pre-install gate
+    # reads its parent bytes from --vllm-root and never opens it, so requiring it
+    # there would demand a path that does not exist yet; a default would name one
+    # the installer does not use.
+    p.add_argument('--archive',type=Path)
     p.add_argument('--causal-archive',type=Path,required=True)
     p.add_argument('--installed',action='store_true')
     args=p.parse_args()
+    if args.installed and args.archive is None: p.error('--installed needs --archive')
     ztest=gen.load_dependency('decode_z/test_decode_segments_cpu.py','composite_segments_cpu')
     ftest=gen.load_dependency('flat/test_fp8_prefill_flat_cpu.py','composite_flat_cpu')
     if args.installed:

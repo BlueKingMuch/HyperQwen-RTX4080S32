@@ -46,7 +46,7 @@ if [ ! -x "$PY" ]; then
   done
 fi
 if [ "${1:-}" = "--write-sums" ]; then
-  ( cd "$HERE" && find . -type f ! -name 'SHA256SUMS*' ! -name install.sh -printf '%P\n' \
+  ( cd "$HERE" && find . -type f ! -path '*/__pycache__/*' ! -name 'SHA256SUMS*' ! -name install.sh -printf '%P\n' \
       | sort | while IFS= read -r f; do printf '%s *%s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done \
       > SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS )
   echo "fp8/SHA256SUMS re-cut over $(grep -c . "$HERE/SHA256SUMS") files"
@@ -88,12 +88,37 @@ echo "   series: ${SERIES[*]}"
 
 if [ "${1:-}" = "--check" ]; then
   "$PY" - "$HERE" <<'PY'
-import ast, pathlib, sys
+import ast, hashlib, pathlib, sys
 root = pathlib.Path(sys.argv[1])
-files = sorted(root.rglob('*.py'))
+files = sorted(p for p in root.rglob('*.py') if '__pycache__' not in p.parts)
 for path in files:
     ast.parse(path.read_text(encoding='utf8'), str(path))
 print("   %d python files parse" % len(files))
+
+# install_composite.py pins the four files it loads. Those four sit in this
+# directory rather than in the vLLM tree, so they are the one set of pins that
+# is checkable without an install -- and the one set a repin can leave behind,
+# because SHA256SUMS is re-cut from the files while this table is not. Read it
+# with ast rather than importing: the import asserts these very hashes, and it
+# would leave a __pycache__ behind for --write-sums to seal.
+installer = root / 'fp8-composite/install_composite.py'
+tree = ast.parse(installer.read_text(encoding='utf8'), str(installer))
+node = next(n.value for n in tree.body if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == 'DEPENDENCIES' for t in n.targets))
+pins = ast.literal_eval(node)
+stale = [(r, want, hashlib.sha256((installer.parent / r).read_bytes()).hexdigest())
+         for r, want in pins.items()]
+stale = [(r, want, have) for r, want, have in stale if want != have]
+if stale:
+    print("ERROR: install_composite.py pins files that have moved:", file=sys.stderr)
+    for relative, want, have in stale:
+        print("   %s" % relative, file=sys.stderr)
+        print("      pinned %s" % want, file=sys.stderr)
+        print("      actual %s" % have, file=sys.stderr)
+    print("   run scripts/repin-fp8-installers.py, then fp8/install.sh --write-sums",
+          file=sys.stderr)
+    raise SystemExit(1)
+print("   %d install_composite dependency pins: OK" % len(pins))
 PY
   echo "fp8: inputs OK (--check: nothing installed)"
   exit 0
