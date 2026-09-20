@@ -66,6 +66,12 @@ triton-fp8-mq3d-dispatch-trace.patch
 mq3d-mixed-target.patch
 block-verification-invalid-draft.patch
 
+# --- INT4 KV fixes ------------------------------------------------------------
+# A defect in upstream's int4-kv-per-token-head, not in anything added here.
+# Cut against the tree the series above leaves behind. int4_per_token_head.py is
+# last touched by spec-decode-scratch-within-budget, and nothing below reads it.
+int4-noncausal-tile-bounds.patch
+
 # --- Upstream fixes -----------------------------------------------------------
 # Open upstream, carried here. Cut against the tree the whole series above
 # leaves behind, so this entry stays last.
