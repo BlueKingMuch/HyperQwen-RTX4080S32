@@ -1,0 +1,80 @@
+Keep the SSE framing intact in the benchmark client's stream reader.
+
+vllm/benchmarks/lib/endpoint_request_func.py strips each raw chunk before
+handing it to StreamedResponseHandler, at all three streaming call sites. That
+removes the blank line ending an SSE message, which is what the handler splits
+on. Its fallback only empties the buffer when it starts with "data: ", so a
+": keep-alive" comment line stays there, every later message is appended behind
+it, and the buffer never starts with "data: " again. Every token of that
+request is lost and the client reports
+
+  Never received a valid chunk to calculate TTFT.This response will be marked
+  as failed!
+
+Reproduced against the shipped handler, no server needed:
+
+  without keep-alive:  add_chunk -> ['data: {"a":1}'], ['data: {"a":2}']
+  with keep-alive:     add_chunk -> [], [], []
+                       buffer: ': keep-alivedata: {"a":1}data: {"a":2}'
+
+Not stripping restores it: the comment line comes out as its own message and
+the existing `if message.startswith(":"): continue` drops it, which is what the
+reader was already written to do.
+
+Only visible when a prefill outlasts the server's keep-alive interval, so
+ordinary short-prompt runs never hit it. Here patches/sse-keep-alive.patch
+emits the comment lines and single-user/start_qwen.sh sets the interval to 30 s,
+so bench/run_benchmarks.sh --long (1x100k, 4x60k) reports zero for every timing
+while the server generates normally: 89 drafts, 168 accepted tokens, acceptance
+length 2.89, and meanTTFT=0.00 / TPOT=0.00 beside it.
+
+--- a/benchmarks/lib/endpoint_request_func.py
++++ b/benchmarks/lib/endpoint_request_func.py
+@@ -205,8 +205,13 @@
+                 handler = StreamedResponseHandler()
+ 
+                 async for chunk_bytes in response.content.iter_any():
+-                    chunk_bytes = chunk_bytes.strip()
+-                    if not chunk_bytes:
++                    # Do not strip here: it removes the blank line that ends an SSE
++                    # message, which is what StreamedResponseHandler splits on. A
++                    # ': keep-alive' comment line then stays in the buffer, which is only
++                    # emptied when it starts with 'data: ' -- after that it never does
++                    # again and every later message is lost. Only reachable when a prefill
++                    # outlasts the server's keep-alive interval.
++                    if not chunk_bytes.strip():
+                         continue
+ 
+                     messages = handler.add_chunk(chunk_bytes)
+@@ -383,8 +388,13 @@
+             if response.status == 200:
+                 handler = StreamedResponseHandler()
+                 async for chunk_bytes in response.content.iter_any():
+-                    chunk_bytes = chunk_bytes.strip()
+-                    if not chunk_bytes:
++                    # Do not strip here: it removes the blank line that ends an SSE
++                    # message, which is what StreamedResponseHandler splits on. A
++                    # ': keep-alive' comment line then stays in the buffer, which is only
++                    # emptied when it starts with 'data: ' -- after that it never does
++                    # again and every later message is lost. Only reachable when a prefill
++                    # outlasts the server's keep-alive interval.
++                    if not chunk_bytes.strip():
+                         continue
+ 
+                     message_strings = handler.add_chunk(chunk_bytes)
+@@ -504,8 +514,13 @@
+                     handler = StreamedResponseHandler()
+ 
+                     async for chunk_bytes in response.content.iter_any():
+-                        chunk_bytes = chunk_bytes.strip()
+-                        if not chunk_bytes:
++                        # Do not strip here: it removes the blank line that ends an SSE
++                        # message, which is what StreamedResponseHandler splits on. A
++                        # ': keep-alive' comment line then stays in the buffer, which is only
++                        # emptied when it starts with 'data: ' -- after that it never does
++                        # again and every later message is lost. Only reachable when a prefill
++                        # outlasts the server's keep-alive interval.
++                        if not chunk_bytes.strip():
+                             continue
+ 
+                         messages = handler.add_chunk(chunk_bytes)
