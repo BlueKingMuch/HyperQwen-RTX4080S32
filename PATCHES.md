@@ -17,6 +17,31 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 <commit> patches/<topic>.patch`; do not edit the files by hand. A patch that reads an env knob registers it in
 `envs.py` in its own hunk (so the knob is in the torch.compile cache key), and reads it through `vllm.envs`.
 
+Every change to the installed vLLM tree is a patch file, applied with `patch -p1 --fuzz 0`. No installer rewrites
+installed sources by anchor matching, string replacement or code generation: `--fuzz 0` verifies the context it
+applies to, an anchor-based rewrite does not, and each one that skips it has to carry a substitute — sha256 pins of
+every file it reads, a reversibility seal, and a repin cascade when anything upstream of it moves. Measured on this
+repo: the apply loop checks 48 patches in 0.07 s; the pins, seals and gates standing in for it across three
+generator steps cost 72 s per build, and a change to `envs.py` under that scheme moves five pin locations. A step's
+position in its `series` file expresses ordering; `fp8/fp8-paged` is two ordinary patch files applied after
+`patches/series` and after `kvarn/install.sh`, so a patch works at every position in this pipeline.
+
+A patch is active by default. The safety net is not a flag, it is that the patch breaks nothing else while
+active — the shape, dtype and capability guard in the code is what makes that true, and it is the guard, not an
+env knob, that has to be right. `_fp8_full_causal` in `v1/attention/ops/triton_unified_attention.py` is 24 ANDed
+terms: sm_89, fp8-per-tensor KV, fp8 q/k/v, bf16 out, 24 query heads, 4 KV heads, head_size 256, block_size 880
+or 896, causal, no sliding window, no softcap, no alibi, no sinks. Those 23 terms already refuse every other
+configuration; the env flag in front of them adds only the ability to ship the patch inactive. An env knob is for
+a choice that is genuinely open at the same shape, or for diagnostics. Where the better value follows from a
+quantity known at launch — context length, batch size, draft count — that is a rule, not a switch.
+
+A knob that restates a number the configuration already carries is worse than useless, because the two sources
+diverge silently. `VLLM_TRITON_FP8_MQ3D_QMAX` is the literal `8` in `fp8/env.sh:42` while
+`VLLM_SPEC_DECODE_ATTN_QMAX` is `DRAFT_TOKENS + 1` in `single-user/start_qwen.sh:321` and `spec_decode_attn.py`
+caps at `min(64, max(n, BLOCK_M // G)) = 10`. All three agree only at `DFLASH_TOKENS=7`. At the documented
+`DFLASH_TOKENS=15` the verify block is 16, the MQ3D gate `1 < max_seqlen_q <= QMAX` reads `1 < 16 <= 8`, and the
+fast path turns off with nothing logged. Derive such a number from its one source.
+
 | patch | kind | what | upstream | cut against | retires when |
 |---|---|---|---|---|---|
 | dflash2-backport | backport, RETIRED | DFlash2 speculator on 0.27.1 | vllm #52816 (in 0.28.0) | 0.27.1 | done; kept for history, skipped by the Dockerfile |

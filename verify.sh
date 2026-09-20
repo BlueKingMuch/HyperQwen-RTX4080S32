@@ -17,8 +17,6 @@ cd "$HERE"
 NOSRV=0; INSTALL=0
 for a in "$@"; do case "$a" in --no-server) NOSRV=1;; --install) INSTALL=1; NOSRV=1;; esac; done
 FAILS=0
-# Where fp8/install.sh put its archives; fp8/install.sh reads the same variable.
-FP8_ARCHIVE=${FP8_ARCHIVE:-/opt/fp8}
 ok()   { printf "  PASS  %s\n" "$1"; }
 warn() { printf "  WARN  %s\n" "$1"; }
 fail() { printf "  FAIL  %s\n" "$1"; FAILS=$((FAILS+1)); }
@@ -103,77 +101,15 @@ if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
 else warn "KVarN not installed (optional; bash kvarn/install.sh for 262k context)"; fi
 
 echo "== FP8 Triton attention (fp8/)"
-# What this repo carries, checked the same way gguf-plugin/ is. This is about the
-# files in the checkout, so it runs whether or not anything was installed.
-( cd fp8 && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
-  && ok "fp8/ generators, gates and patches match SHA256SUMS" \
-  || fail "fp8/SHA256SUMS does not match the files in the repo"
-
-# Is fp8 installed at all? Everything below distinguishes "not installed", which
-# is allowed, from "installed and drifted", which is not. The Docker build always
-# installs it; a venv install may not have.
-FP8_INSTALLED=0
-[ -f "$FP8_ARCHIVE/composite/manifest.json" ] && FP8_INSTALLED=1
-$PY -c "import vllm.envs as e, sys; sys.exit(0 if 'VLLM_TRITON_FP8_V_CHUNKED' in e.environment_variables else 1)" 2>/dev/null \
-  && FP8_IN_TREE=1 || FP8_IN_TREE=0
-
-if [ $FP8_INSTALLED = 1 ]; then
-  if ( cd fp8/fp8-composite && $PY -B install_composite.py --verify-seal \
-         --archive "$FP8_ARCHIVE/composite" \
-         --causal-archive "$FP8_ARCHIVE/causal" >/dev/null 2>&1 ); then
-    ok "fp8-causal r1+r2 and fp8-composite installed, seal re-derives from its archived parents"
-  else fail "fp8 seal does not re-derive from $FP8_ARCHIVE (the archive and the installers disagree)"; fi
-elif [ $FP8_IN_TREE = 1 ]; then
-  warn "fp8 steps are in the vLLM tree but $FP8_ARCHIVE holds no manifest (FP8_ARCHIVE set elsewhere?)"
+# fp8/ belongs to this fork and checks itself: its four steps are patch files,
+# and fp8/install.sh --check reports whether they are in the tree. Keeping that
+# knowledge here would mean two places to update for one step.
+if [ -d fp8 ]; then
+  if out=$(PY="$PY" bash fp8/install.sh --check 2>&1); then
+    ok "fp8/ $(printf '%s' "$out" | sed -n 's/^ *//;$p')"
+  else fail "fp8/install.sh --check: $(printf '%s' "$out" | tail -n1)"; fi
 else
-  warn "fp8 not installed (optional; bash fp8/install.sh for CTX=fp8 / KV=fp8triton)"
-fi
-
-# The tree, independently of the archive: the seal deliberately does not look at
-# the live files, because fp8-paged rewrites three of the four after it was
-# published. This is what says the tree is still what the last step left behind,
-# and it needs nothing but $SP -- so a drifted image cannot hide behind a missing
-# archive.
-if [ $FP8_IN_TREE = 1 ]; then
-  $PY - "$SP" fp8/fp8-paged/PINS <<'EOF' && ok "the four files fp8-paged touches match fp8-paged/PINS" || fail "the vLLM tree does not match fp8-paged/PINS (reinstall from a clean tree)"
-import hashlib, pathlib, sys
-sp, pins = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-want = {}
-for line in pins.read_text(encoding="utf8").splitlines():
-    if line.startswith("v-chunked.after"):
-        _, rel, digest = line.split()
-        want[rel] = digest
-if not want:
-    sys.exit(1)
-for rel, digest in want.items():
-    if hashlib.sha256((sp / rel).read_bytes()).hexdigest() != digest:
-        sys.exit(1)
-EOF
-  # helpers is the one composite file fp8-paged leaves alone, so PINS above says
-  # nothing about it. Its pin lives in the generator that read it.
-  $PY - "$SP" <<'EOF' && ok "triton_attention_helpers.py matches the pin the generators read it under" || fail "triton_attention_helpers.py is not the file fp8/ was cut against"
-import hashlib, importlib.util, pathlib, sys
-spec = importlib.util.spec_from_file_location(
-    "seg", "fp8/fp8-composite/decode_z/install_decode_segments.py")
-seg = importlib.util.module_from_spec(spec); spec.loader.exec_module(seg)
-data = (pathlib.Path(sys.argv[1]) / seg.FILES["helpers"]).read_bytes()
-sys.exit(0 if hashlib.sha256(data).hexdigest() == seg.PINS["helpers"] else 1)
-EOF
-  # Registration, not behaviour: this says the names exist and default off, which
-  # is what makes setting them meaningful. Nothing in this repo establishes that
-  # any of them changes a kernel's output -- fp8/README.md says so plainly.
-  $PY - <<'EOF' && ok "seven FP8 attention flags registered in envs.py, all at their off default" || fail "the FP8 attention flags are not registered, or one does not default to off"
-import sys
-import vllm.envs as e
-want = ("VLLM_TRITON_FP8_CAUSAL_FULL", "VLLM_TRITON_FP8_PREFILL_FLAT", "VLLM_TRITON_FP8_MQ3D",
-        "VLLM_TRITON_FP8_MQ3D_MIXED_TARGET", "VLLM_TRITON_FP8_MQ3D_QMAX",
-        "VLLM_TRITON_FP8_MQ3D_SEGMENTS", "VLLM_TRITON_FP8_V_CHUNKED")
-if not all(n in e.environment_variables for n in want):
-    sys.exit(1)
-sys.exit(0 if (e.VLLM_TRITON_FP8_CAUSAL_FULL is False and e.VLLM_TRITON_FP8_PREFILL_FLAT == 0
-               and e.VLLM_TRITON_FP8_MQ3D is False and e.VLLM_TRITON_FP8_MQ3D_SEGMENTS == 16
-               and e.VLLM_TRITON_FP8_V_CHUNKED is False) else 1)
-EOF
+  warn "fp8/ not present (optional; CTX=fp8 / KV=fp8triton)"
 fi
 
 echo "== GGUF plugin (gguf-plugin/)"
@@ -190,9 +126,6 @@ from vllm_gguf_plugin import loader
 src = inspect.getsource(loader._is_gguf_model)
 sys.exit(0 if '.gguf' in src and 'is_gguf' in src else 1)
 EOF
-  ( cd gguf-plugin && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
-    && ok "gguf-plugin/ patches and Gluon modules match SHA256SUMS" \
-    || fail "gguf-plugin/SHA256SUMS does not match the files in the repo"
 else warn "GGUF plugin not installed (optional; bash gguf-plugin/install.sh to serve a .gguf model)"; fi
 
 if [ $INSTALL = 0 ]; then

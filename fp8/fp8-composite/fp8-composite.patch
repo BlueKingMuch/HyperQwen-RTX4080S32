@@ -1,0 +1,469 @@
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -35,6 +35,10 @@
+ trace_fp8_mq3d_dispatch = envs.VLLM_TRITON_FP8_MQ3D_TRACE
+ float8_info = torch.finfo(current_platform.fp8_dtype())
+ _FP8_CAUSAL_FULL = envs.VLLM_TRITON_FP8_CAUSAL_FULL
++_FP8_PREFILL_FLAT_TEXT = __import__("os").environ.get("VLLM_TRITON_FP8_PREFILL_FLAT", "0")
++if _FP8_PREFILL_FLAT_TEXT not in ("0", "1"):
++    raise ValueError("VLLM_TRITON_FP8_PREFILL_FLAT must be 0 or 1")
++_FP8_PREFILL_FLAT = _FP8_PREFILL_FLAT_TEXT == "1"
+ 
+ 
+ @triton.jit
+@@ -309,6 +313,7 @@
+     # original (causal AND SW) OR mm_prefix behavior for all other models.
+     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+     FP8_FULL_CAUSAL: tl.constexpr = False,
++    FP8_FLAT_PHASE: tl.constexpr = -1,
+ ):
+     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
+     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
+@@ -341,18 +346,59 @@
+     kv_head_idx = tl.program_id(1)
+     segm_idx = tl.program_id(2) if IS_3D else 0
+ 
+-    (
+-        seq_idx,
+-        q_block_local_idx,
+-        cur_batch_in_all_start_index,
+-        cur_batch_query_len,
+-        seq_len,
+-    ) = resolve_seq_and_query_len(
+-        query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
+-    )
+-
+-    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+-        return
++    if FP8_FLAT_PHASE >= 0:
++        tl.static_assert(FP8_FLAT_PHASE < 3 and not IS_3D and FP8_FULL_CAUSAL)
++        # Reserve 32 legacy BQ2 slots per request for phase-zero widths <=63.
++        left = 0
++        right = num_seqs
++        while left < right:
++            mid = (left + right) // 2
++            base = tl.load(query_start_len_ptr + mid) // 8 + 32 * mid
++            if base <= q_block_global_idx:
++                left = mid + 1
++            else:
++                right = mid
++        seq_idx = left - 1
++        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
++        cur_batch_query_len = (
++            tl.load(query_start_len_ptr + seq_idx + 1)
++            - cur_batch_in_all_start_index
++        )
++        seq_len = tl.load(seq_lens_ptr + seq_idx)
++        q_block_local_idx = q_block_global_idx - (
++            cur_batch_in_all_start_index // 8 + 32 * seq_idx
++        )
++        if FP8_FLAT_PHASE == 0:
++            _flat_token_base = tl.where(
++                cur_batch_query_len >= 64,
++                q_block_local_idx * 8,
++                q_block_local_idx * BLOCK_Q,
++            )
++            _flat_row_shift = 0
++        else:
++            if cur_batch_query_len < 64:
++                return
++            _flat_token_base = q_block_local_idx * 8
++            _flat_row_shift = FP8_FLAT_PHASE * BLOCK_M
++        _flat_qmin = _flat_token_base + _flat_row_shift // num_queries_per_kv
++        _flat_qmax = (
++            _flat_token_base + (_flat_row_shift + BLOCK_M - 1) // num_queries_per_kv
++        )
++        if _flat_qmin >= cur_batch_query_len:
++            return
++    else:
++        (
++            seq_idx,
++            q_block_local_idx,
++            cur_batch_in_all_start_index,
++            cur_batch_query_len,
++            seq_len,
++        ) = resolve_seq_and_query_len(
++            query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
++        )
++
++        if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
++            return
+ 
+     if IS_3D:
+         tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+@@ -370,10 +416,16 @@
+     offs_m = tl.arange(0, BLOCK_M)
+     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+     offs_t = tl.arange(0, TILE_SIZE)
+-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+-
++    if FP8_FLAT_PHASE >= 0:
++        query_pos = _flat_token_base + (_flat_row_shift + offs_m) // num_queries_per_kv
++        query_offset_1 = (
++            kv_head_idx * num_queries_per_kv
++            + (_flat_row_shift + offs_m) % num_queries_per_kv
++        )
++    else:
++        query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
++        query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+     query_offset_0 = cur_batch_in_all_start_index + query_pos
+-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+     query_offset = (
+         query_offset_0[:, None] * query_stride_0
+         + query_offset_1[:, None] * query_stride_1
+@@ -431,31 +483,42 @@
+     if USE_QQ_BIAS:
+         qq_bias_row_ptrs = qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+ 
+-    loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
+-        context_len,
+-        seq_len,
+-        cur_batch_query_len,
+-        q_block_local_idx,
+-        segm_idx,
+-        tiles_per_segment,
+-        TILE_SIZE,
+-        BLOCK_M,
+-        BLOCK_Q,
+-        num_queries_per_kv,
+-        SLIDING_WINDOW,
+-        USE_MM_PREFIX or USE_R_SWA,
+-        IS_3D,
+-        USE_CAUSAL,
+-        USE_PER_SEQ_CAUSAL,
+-        CHUNK_LOOKBACK,
+-        CHUNK_SIZE,
+-    )
++    if FP8_FLAT_PHASE >= 0:
++        # Phase1 spans four query positions: the native BQ2 helper cannot be reused.
++        max_seq_prefix_len = tl.minimum(seq_len, context_len + _flat_qmax + 1)
++        loop_lo = 0
++        loop_hi = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
++    else:
++        loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
++            context_len,
++            seq_len,
++            cur_batch_query_len,
++            q_block_local_idx,
++            segm_idx,
++            tiles_per_segment,
++            TILE_SIZE,
++            BLOCK_M,
++            BLOCK_Q,
++            num_queries_per_kv,
++            SLIDING_WINDOW,
++            USE_MM_PREFIX or USE_R_SWA,
++            IS_3D,
++            USE_CAUSAL,
++            USE_PER_SEQ_CAUSAL,
++            CHUNK_LOOKBACK,
++            CHUNK_SIZE,
++        )
+ 
+     # iterate through tiles (now limited to the sliding window range)
+     if FP8_FULL_CAUSAL:
+-        full_end = tl.maximum(loop_lo, tl.minimum(
+-            loop_hi, (context_len + q_block_local_idx * BLOCK_Q + 1) // TILE_SIZE
+-        ))
++        if FP8_FLAT_PHASE >= 0:
++            full_end = tl.maximum(loop_lo, tl.minimum(
++                loop_hi, (context_len + _flat_qmin + 1) // TILE_SIZE
++            ))
++        else:
++            full_end = tl.maximum(loop_lo, tl.minimum(
++                loop_hi, (context_len + q_block_local_idx * BLOCK_Q + 1) // TILE_SIZE
++            ))
+         for j in range(loop_lo, full_end):
+             seq_offset = j * TILE_SIZE + offs_t
+             tile_mask = tl.full((TILE_SIZE,), True, tl.int1)
+@@ -1522,85 +1585,96 @@
+             max_seqlen_q, scope="process",
+         )
+ 
+-    kernel_unified_attention[grid](
+-        output_ptr=out,
+-        segm_output_ptr=segm_output_ptr,
+-        segm_max_ptr=segm_max_ptr,
+-        segm_expsum_ptr=segm_expsum_ptr,
+-        query_ptr=q,
+-        key_cache_ptr=k,
+-        value_cache_ptr=v,
+-        sink_ptr=sinks,
+-        block_tables_ptr=block_table,
+-        seq_lens_ptr=seqused_k,
+-        alibi_slopes_ptr=alibi_slopes,
+-        qq_bias_ptr=qq_bias,
+-        k_scale_cache_ptr=k_scale_ptr,
+-        v_scale_cache_ptr=v_scale_ptr,
+-        scale=softmax_scale,
+-        q_scale=q_descale,
+-        k_scale=k_descale,
+-        v_scale=v_descale,
+-        out_scale=1 / output_scale if output_scale is not None else 1.0,
+-        softcap=softcap,
+-        num_query_heads=num_query_heads,
+-        num_queries_per_kv=num_queries_per_kv,
+-        block_table_stride=block_table.stride(0),
+-        query_stride_0=q.stride(0),
+-        query_stride_1=q.stride(1),
+-        output_stride_0=out.stride(0),
+-        output_stride_1=out.stride(1),
+-        qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+-        BLOCK_SIZE=block_size,
+-        TILE_SIZE=tile_size,
+-        HEAD_SIZE=head_size,
+-        HEAD_SIZE_PADDED=head_size_padded,
+-        USE_ALIBI_SLOPES=use_alibi_slopes,
+-        USE_ALIBI_SQRT=use_alibi_sqrt,
+-        USE_QQ_BIAS=use_qq_bias,
+-        USE_SOFTCAP=(softcap > 0),
+-        USE_SINKS=(sinks is not None),
+-        SLIDING_WINDOW=(1 + window_size[0]),
+-        USE_CAUSAL=use_causal,
+-        USE_PER_SEQ_CAUSAL=use_per_seq_causal,
+-        per_seq_causal_ptr=per_seq_causal_ptr,
+-        USE_MM_PREFIX=use_mm_prefix,
+-        MAX_MM_RANGES=max_mm_ranges,
+-        mm_prefix_range_ptr=mm_prefix_range,
+-        rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
+-        R_SWA_WINDOW=rswa_window or 0,
+-        USE_R_SWA=use_rswa,
+-        stride_k_cache_0=k.stride(0),
+-        stride_k_cache_1=k.stride(1),
+-        stride_k_cache_2=k.stride(2),
+-        stride_k_cache_3=k.stride(3),
+-        stride_v_cache_0=v.stride(0),
+-        stride_v_cache_1=v.stride(1),
+-        stride_v_cache_2=v.stride(2),
+-        stride_v_cache_3=v.stride(3),
+-        stride_ks_blk=ks_blk,
+-        stride_ks_slot=ks_slot,
+-        stride_ks_head=ks_head,
+-        stride_vs_blk=vs_blk,
+-        stride_vs_slot=vs_slot,
+-        stride_vs_head=vs_head,
+-        query_start_len_ptr=cu_seqlens_q,
+-        BLOCK_Q=BLOCK_Q,
+-        num_seqs=num_seqs,
+-        BLOCK_M=BLOCK_M,
+-        NUM_SEGMENTS_PER_SEQ=num_segments,
+-        USE_FP8=output_scale is not None,
+-        IS_3D=use_3d,
+-        KV_QUANT_MODE=kv_quant_mode,
+-        Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
+-        FP8_FULL_CAUSAL=_fp8_full_causal,
+-        CHUNK_LOOKBACK=chunk_lookback,
+-        CHUNK_SIZE=chunk_size,
+-        USE_TD=use_td,
+-        USE_TD_QO=use_td_qo,
+-        MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
+-        **launch_kwargs,
+-    )
++    _fp8_flat_prefill = (
++        _FP8_PREFILL_FLAT and _fp8_full_causal
++        and not use_3d and max_seqlen_q >= 64 and q.shape[0] >= 64
++    )
++    _fp8_flat_phases = (0, 1, 2) if _fp8_flat_prefill else (-1,)
++    for _fp8_flat_phase in _fp8_flat_phases:
++        _fp8_flat_grid = (
++            (q.shape[0] // 8 + 32 * num_seqs, num_kv_heads)
++            if _fp8_flat_phase >= 0 else grid
++        )
++        kernel_unified_attention[_fp8_flat_grid](
++            output_ptr=out,
++            segm_output_ptr=segm_output_ptr,
++            segm_max_ptr=segm_max_ptr,
++            segm_expsum_ptr=segm_expsum_ptr,
++            query_ptr=q,
++            key_cache_ptr=k,
++            value_cache_ptr=v,
++            sink_ptr=sinks,
++            block_tables_ptr=block_table,
++            seq_lens_ptr=seqused_k,
++            alibi_slopes_ptr=alibi_slopes,
++            qq_bias_ptr=qq_bias,
++            k_scale_cache_ptr=k_scale_ptr,
++            v_scale_cache_ptr=v_scale_ptr,
++            scale=softmax_scale,
++            q_scale=q_descale,
++            k_scale=k_descale,
++            v_scale=v_descale,
++            out_scale=1 / output_scale if output_scale is not None else 1.0,
++            softcap=softcap,
++            num_query_heads=num_query_heads,
++            num_queries_per_kv=num_queries_per_kv,
++            block_table_stride=block_table.stride(0),
++            query_stride_0=q.stride(0),
++            query_stride_1=q.stride(1),
++            output_stride_0=out.stride(0),
++            output_stride_1=out.stride(1),
++            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
++            BLOCK_SIZE=block_size,
++            TILE_SIZE=tile_size,
++            HEAD_SIZE=head_size,
++            HEAD_SIZE_PADDED=head_size_padded,
++            USE_ALIBI_SLOPES=use_alibi_slopes,
++            USE_ALIBI_SQRT=use_alibi_sqrt,
++            USE_QQ_BIAS=use_qq_bias,
++            USE_SOFTCAP=(softcap > 0),
++            USE_SINKS=(sinks is not None),
++            SLIDING_WINDOW=(1 + window_size[0]),
++            USE_CAUSAL=use_causal,
++            USE_PER_SEQ_CAUSAL=use_per_seq_causal,
++            per_seq_causal_ptr=per_seq_causal_ptr,
++            USE_MM_PREFIX=use_mm_prefix,
++            MAX_MM_RANGES=max_mm_ranges,
++            mm_prefix_range_ptr=mm_prefix_range,
++            rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
++            R_SWA_WINDOW=rswa_window or 0,
++            USE_R_SWA=use_rswa,
++            stride_k_cache_0=k.stride(0),
++            stride_k_cache_1=k.stride(1),
++            stride_k_cache_2=k.stride(2),
++            stride_k_cache_3=k.stride(3),
++            stride_v_cache_0=v.stride(0),
++            stride_v_cache_1=v.stride(1),
++            stride_v_cache_2=v.stride(2),
++            stride_v_cache_3=v.stride(3),
++            stride_ks_blk=ks_blk,
++            stride_ks_slot=ks_slot,
++            stride_ks_head=ks_head,
++            stride_vs_blk=vs_blk,
++            stride_vs_slot=vs_slot,
++            stride_vs_head=vs_head,
++            query_start_len_ptr=cu_seqlens_q,
++            BLOCK_Q=BLOCK_Q,
++            num_seqs=num_seqs,
++            BLOCK_M=BLOCK_M,
++            NUM_SEGMENTS_PER_SEQ=num_segments,
++            USE_FP8=output_scale is not None,
++            IS_3D=use_3d,
++            KV_QUANT_MODE=kv_quant_mode,
++            Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
++            FP8_FULL_CAUSAL=_fp8_full_causal,
++            FP8_FLAT_PHASE=_fp8_flat_phase,
++            CHUNK_LOOKBACK=chunk_lookback,
++            CHUNK_SIZE=chunk_size,
++            USE_TD=use_td,
++            USE_TD_QO=use_td_qo,
++            MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
++            **launch_kwargs,
++        )
+ 
+     if use_3d:
+         reduce_segments[(q.shape[0], num_query_heads)](
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -59,6 +59,24 @@
+ # constants
+ MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
+ NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
++
++# Startup-frozen, target-only experiment. Existing/default geometry is Z16.
++_FP8_MQ3D_SEGMENTS = envs.VLLM_TRITON_FP8_MQ3D_SEGMENTS
++if _FP8_MQ3D_SEGMENTS not in (16, 32):
++    raise ValueError("VLLM_TRITON_FP8_MQ3D_SEGMENTS must be 16 or 32")
++
++
++def _select_fp8_mq3d_segments(num_heads_q, num_heads_kv, headdim, block_size, kv_quant_mode):
++    if (
++        _FP8_MQ3D_SEGMENTS == 32
++        and envs.VLLM_TRITON_FP8_MQ3D
++        and kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
++        and num_heads_q == 24 and num_heads_kv == 4 and headdim == 256
++        and block_size == 880
++        and current_platform.is_device_capability(89)
++    ):
++        return 32
++    return NUM_PAR_SOFTMAX_SEGMENTS
+ # Max query tokens PER SEQUENCE eligible for the 3D path. ONE source: it bounds both
+ # eligibility (max_seqlen_q) and allocation (scratch_token_capacity_3d), so the two can
+ # never drift apart the way a literal in the dispatch site did.
+@@ -105,9 +123,12 @@
+     row_bytes: int
+     max_num_batched_tokens: int
+     max_num_seqs: int
+-
+-
+-def mq3d_scratch_plan(vllm_config: VllmConfig, num_heads_q: int) -> Mq3dScratchPlan:
++    segments: int                  # PARALLEL SOFTMAX SEGMENTS  (allocation)
++
++
++def mq3d_scratch_plan(
++    vllm_config: VllmConfig, num_heads_q: int, segments: int = NUM_PAR_SOFTMAX_SEGMENTS
++) -> Mq3dScratchPlan:
+     model_config = vllm_config.model_config
+     num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
+     headdim = model_config.get_head_size()
+@@ -140,10 +161,11 @@
+     )
+     headdim_padded = next_power_of_2(headdim)
+     row_bytes = 4 * (
+-        num_heads_q * NUM_PAR_SOFTMAX_SEGMENTS * headdim_padded
+-        + 2 * num_heads_q * NUM_PAR_SOFTMAX_SEGMENTS
++        num_heads_q * segments * headdim_padded
++        + 2 * num_heads_q * segments
+     )
+     return Mq3dScratchPlan(
++        segments=segments,
+         num_heads_q=num_heads_q,
+         num_heads_kv=num_heads_kv,
+         headdim_padded=headdim_padded,
+@@ -162,12 +184,12 @@
+     def __init__(self, plan: Mq3dScratchPlan, device: torch.device, origin: str):
+         rows = plan.capacity
+         self.output = torch.empty(
+-            (rows, plan.num_heads_q, NUM_PAR_SOFTMAX_SEGMENTS, plan.headdim_padded),
++            (rows, plan.num_heads_q, plan.segments, plan.headdim_padded),
+             dtype=torch.float32,
+             device=device,
+         )
+         self.max = torch.empty(
+-            (rows, plan.num_heads_q, NUM_PAR_SOFTMAX_SEGMENTS),
++            (rows, plan.num_heads_q, plan.segments),
+             dtype=torch.float32,
+             device=device,
+         )
+@@ -199,7 +221,7 @@
+     only a set no builder has adopted; the rest allocate their own, after the
+     profile, and say so."""
+     dev = torch.device(device)
+-    key = (dev.type, dev.index, plan.num_heads_q, NUM_PAR_SOFTMAX_SEGMENTS, plan.headdim_padded)
++    key = (dev.type, dev.index, plan.num_heads_q, plan.segments, plan.headdim_padded)
+     have = _MQ3D_SCRATCH_POOL.get(key)
+     fits = have is not None and have.capacity >= plan.capacity
+     if fits and not (exclusive and have.adopters > 0):
+@@ -314,7 +336,10 @@
+             )
+         )
+ 
+-        self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
++        self.num_par_softmax_segments = _select_fp8_mq3d_segments(
++            self.num_heads_q, self.num_heads_kv, self.headdim,
++            self.block_size, kv_cache_spec.kv_quant_mode,
++        )
+         # ---- UNIT SPLIT ------------------------------------------------------------
+         # These three quantities were one variable, in three different units. The
+         # scratch buffers are indexed by QUERY TOKEN, but were sized by
+@@ -335,7 +360,9 @@
+         # requires num_seqs <= seq_threshold_3D, and no batch can carry more query
+         # tokens than the scheduler will place in one, so this is the smallest
+         # capacity that can hold every policy-eligible batch.
+-        plan = mq3d_scratch_plan(self.vllm_config, self.num_heads_q)
++        plan = mq3d_scratch_plan(
++            self.vllm_config, self.num_heads_q, self.num_par_softmax_segments
++        )
+         assert (plan.num_heads_kv, plan.headdim_padded) == (
+             self.num_heads_kv, next_power_of_2(self.headdim)
+         ), "int4 3D scratch plan geometry disagrees with the builder's"
+--- a/envs.py
++++ b/envs.py
+@@ -1602,6 +1602,8 @@
+     # Opt-in FP8 multi-query 3D Triton attention. Registration makes both
+     # graph-shaping values part of vLLM's compile-factor environment.
+     "VLLM_TRITON_FP8_CAUSAL_FULL": lambda: bool(int(os.environ.get("VLLM_TRITON_FP8_CAUSAL_FULL", "0"))),
++    "VLLM_TRITON_FP8_PREFILL_FLAT": lambda: {"0": 0, "1": 1}[os.environ.get("VLLM_TRITON_FP8_PREFILL_FLAT", "0")],
++    "VLLM_TRITON_FP8_MQ3D_SEGMENTS": lambda: int(os.environ.get("VLLM_TRITON_FP8_MQ3D_SEGMENTS", "16")),
+     "VLLM_TRITON_FP8_MQ3D": lambda: bool(
+         int(os.environ.get("VLLM_TRITON_FP8_MQ3D", "0"))
+     ),
