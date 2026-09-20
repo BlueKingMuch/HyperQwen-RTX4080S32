@@ -1,0 +1,23 @@
+--- a/v1/attention/ops/triton_unified_attention.py
++++ b/v1/attention/ops/triton_unified_attention.py
+@@ -1498,6 +1498,7 @@
+ 
+     _fp8_full_causal = (
+         _FP8_CAUSAL_FULL
++        and not use_3d
+         and current_platform.is_device_capability(89)
+         and kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+         and q.dtype == torch.float8_e4m3fn
+@@ -1514,6 +1515,12 @@
+         and sinks is None and output_scale is None and not use_td
+         and not is_batch_invariant
+     )
++
++    if _fp8_full_causal:
++        logger.info_once(
++            "SYV_FP8_CAUSAL_FULL path=2D block=880 q_heads=24 maxq=%d",
++            max_seqlen_q, scope="process",
++        )
+ 
+     kernel_unified_attention[grid](
+         output_ptr=out,

@@ -2,24 +2,15 @@
 set -euo pipefail
 
 # Install the FP8 Triton attention steps into this repo's vLLM venv, in the
-# order ./series gives. The first three are not patch files: they rewrite
-# installed sources by exact anchor matching, guard themselves with sha256 pins
-# of what they read, and prove their output reverses byte-for-byte back to its
-# parent. The last step is two ordinary patches, and those carry their pins in
-# fp8-paged/PINS.
+# order ./series gives. All four are patch files, applied with --fuzz 0: a hunk
+# whose context has moved fails the build by name instead of landing by guess.
 #
-#   bash fp8/install.sh                      # gate, install, gate again
-#   bash fp8/install.sh --check              # verify what this repo carries, write nothing
-#   bash fp8/install.sh --write-sums         # re-cut SHA256SUMS after a repin
-#   FP8_PINS=write bash fp8/install.sh       # install and rewrite fp8-paged/PINS
-#
-# The pins in these files are content-hashed by SHA256SUMS, so anything that
-# rewrites a pin -- scripts/repin-fp8-installers.py, or FP8_PINS=write rewriting
-# fp8-paged/PINS -- leaves that gate stale. --write-sums is how it is re-cut; it
-# is the one mode that does not check the gate first.
+#   bash fp8/install.sh             # apply the four steps
+#   bash fp8/install.sh --check     # the files this repo carries, install nothing
 #
 # Every step runs AFTER patches/series and AFTER kvarn/install.sh, because all
-# of them pin bytes of files those two touch. The order lives in ./series.
+# of them touch files those two touch. The order lives in ./series and is not a
+# preference: each step's context is what the one before it wrote.
 #
 # What the four steps put behind which flag. All default off, and none of them
 # changes a default path:
@@ -31,9 +22,6 @@ set -euo pipefail
 #                     VLLM_TRITON_FP8_MQ3D_SEGMENTS  32 softmax segments (16)
 #   fp8-paged         VLLM_TRITON_FP8_V_CHUNKED      V in one 32-token tile per
 #                                                    chunk inside a KV block
-#
-# When a pin does not match, the tree under it moved. Do not edit the pin:
-# run scripts/repin-fp8-installers.py against the tree and read what moved.
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
@@ -45,176 +33,93 @@ if [ ! -x "$PY" ]; then
     command -v "$c" >/dev/null 2>&1 && "$c" -c '' 2>/dev/null && { PY=$c; break; }
   done
 fi
-if [ "${1:-}" = "--write-sums" ]; then
-  ( cd "$HERE" && find . -type f ! -path '*/__pycache__/*' ! -name 'SHA256SUMS*' ! -name install.sh -printf '%P\n' \
-      | sort | while IFS= read -r f; do printf '%s *%s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done \
-      > SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS )
-  echo "fp8/SHA256SUMS re-cut over $(grep -c . "$HERE/SHA256SUMS") files"
-  exit 0
-fi
-
-# Where the steps write the sources they replace and the manifests that pin
-# them. /opt is right inside the image; a venv install on a machine where /opt is
-# not writable sets FP8_ARCHIVE to somewhere it owns. verify.sh reads the same
-# variable, so both have to agree.
-ARCHIVE=${FP8_ARCHIVE:-/opt/fp8}
-if [ "${1:-}" != "--check" ] && [ -e "$ARCHIVE" ]; then
-  echo "ERROR: $ARCHIVE already exists." >&2
-  echo "       Each step refuses to overwrite an archive, so this run would abort" >&2
-  echo "       part-way. The steps are not idempotent: they rewrite installed" >&2
-  echo "       sources once, from a parent they pin. To reinstall, start from a" >&2
-  echo "       clean vLLM tree and remove $ARCHIVE; to check an existing install," >&2
-  echo "       run verify.sh. FP8_ARCHIVE moves the archive elsewhere." >&2
-  exit 1
-fi
-if [ "${1:-}" != "--check" ]; then
-  mkdir -p "$ARCHIVE" 2>/dev/null || {
-    echo "ERROR: cannot create $ARCHIVE. Set FP8_ARCHIVE to a writable path." >&2; exit 1; }
-  rmdir "$ARCHIVE" 2>/dev/null || true
-fi
 
 say() { printf '== %s\n' "$*"; }
 
-say "what this repo carries"
-( cd "$HERE" && sha256sum -c SHA256SUMS >/dev/null ) \
-  || { echo "ERROR: fp8/SHA256SUMS does not match the files here." >&2; exit 1; }
-echo "   SHA256SUMS: OK"
+# step -> patch files, in apply order within the step.
+patches_for() {
+  case "$1" in
+    fp8-causal)     echo "fp8-causal/fp8-causal.patch" ;;
+    fp8-causal-r2)  echo "fp8-causal/r2/fp8-causal-r2.patch" ;;
+    fp8-composite)  echo "fp8-composite/fp8-composite.patch" ;;
+    fp8-paged)      echo "fp8-paged/triton-fp8-paged-tile-ptrs.patch"
+                    echo "fp8-paged/triton-fp8-v-chunked-b896.patch" ;;
+    *) echo "ERROR: fp8/series names an unknown step: $1" >&2; exit 1 ;;
+  esac
+}
 
 SERIES=()
 while IFS= read -r name; do SERIES+=("$name"); done \
   < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' "$HERE/series")
 [ "${#SERIES[@]}" = 4 ] || { echo "ERROR: fp8/series lists ${#SERIES[@]} steps, not 4" >&2; exit 1; }
-echo "   series: ${SERIES[*]}"
+say "series: ${SERIES[*]}"
+
+for step in "${SERIES[@]}"; do
+  while IFS= read -r rel; do
+    [ -f "$HERE/$rel" ] || { echo "ERROR: $step names $rel, which is not here" >&2; exit 1; }
+  done < <(patches_for "$step")
+done
+
+# Every patch of every step, one per line.
+all_patches() { for step in "${SERIES[@]}"; do patches_for "$step"; done; }
 
 if [ "${1:-}" = "--check" ]; then
-  "$PY" - "$HERE" <<'PY'
-import ast, hashlib, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-files = sorted(p for p in root.rglob('*.py') if '__pycache__' not in p.parts)
-for path in files:
-    ast.parse(path.read_text(encoding='utf8'), str(path))
-print("   %d python files parse" % len(files))
-
-# install_composite.py pins the four files it loads. Those four sit in this
-# directory rather than in the vLLM tree, so they are the one set of pins that
-# is checkable without an install -- and the one set a repin can leave behind,
-# because SHA256SUMS is re-cut from the files while this table is not. Read it
-# with ast rather than importing: the import asserts these very hashes, and it
-# would leave a __pycache__ behind for --write-sums to seal.
-installer = root / 'fp8-composite/install_composite.py'
-tree = ast.parse(installer.read_text(encoding='utf8'), str(installer))
-node = next(n.value for n in tree.body if isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == 'DEPENDENCIES' for t in n.targets))
-pins = ast.literal_eval(node)
-stale = [(r, want, hashlib.sha256((installer.parent / r).read_bytes()).hexdigest())
-         for r, want in pins.items()]
-stale = [(r, want, have) for r, want, have in stale if want != have]
-if stale:
-    print("ERROR: install_composite.py pins files that have moved:", file=sys.stderr)
-    for relative, want, have in stale:
-        print("   %s" % relative, file=sys.stderr)
-        print("      pinned %s" % want, file=sys.stderr)
-        print("      actual %s" % have, file=sys.stderr)
-    print("   run scripts/repin-fp8-installers.py, then fp8/install.sh --write-sums",
-          file=sys.stderr)
-    raise SystemExit(1)
-print("   %d install_composite dependency pins: OK" % len(pins))
-PY
-  echo "fp8: inputs OK (--check: nothing installed)"
+  echo "   $(all_patches | wc -l) patch files present for ${#SERIES[@]} steps"
+  # If a vLLM tree is reachable, say whether the steps are in it. A reverse dry
+  # run at --fuzz 0 succeeds only against the tree that patch produced; where a
+  # later step rewrote the same lines, the content check settles it.
+  sp=$("$PY" -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' 2>/dev/null | tail -n1)
+  if [ -n "$sp" ] && [ -d "$sp" ]; then
+    miss=0
+    while IFS= read -r rel; do
+      patch -p1 -R --dry-run -s --fuzz 0 -d "$sp" < "$HERE/$rel" >/dev/null 2>&1 && continue
+      "$PY" "$REPO/patches/_check_applied.py" "$HERE/$rel" "$sp" >/dev/null 2>&1 && continue
+      echo "   NOT applied: $rel" >&2; miss=$((miss+1))
+    done < <(all_patches)
+    [ "$miss" = 0 ] || { echo "fp8: $miss of $(all_patches | wc -l) steps are not in $sp" >&2; exit 1; }
+    echo "   all steps applied in $sp"
+  else
+    echo "   no vLLM tree reachable; checked the files only"
+  fi
+  echo "fp8: OK (--check: nothing installed)"
   exit 0
 fi
 
 SP=$("$PY" -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' 2>/dev/null | tail -n1)
 [ -n "$SP" ] && [ -d "$SP" ] || { echo "cannot import vllm with $PY (README: Setup)" >&2; exit 1; }
-SITE=$(dirname "$SP")
 K=v1/attention/ops/triton_unified_attention.py
-H=v1/attention/ops/triton_attention_helpers.py
-
-# A stage of fp8-paged/PINS, checked against the tree or rewritten from it.
-pins() {
-  local stage=$1 line file want have
-  while read -r _ file want; do
-    have=$(sha256sum "$SP/$file" | cut -d' ' -f1)
-    if [ "${FP8_PINS:-}" = write ]; then
-      printf '%-17s %-50s %s\n' "$stage" "$file" "$have" >> "$HERE/fp8-paged/PINS.new"
-    elif [ "$have" != "$want" ]; then
-      echo "ERROR: $stage: $file is $have, not the pinned $want" >&2
-      echo "       The tree under fp8-paged moved. Regenerate: FP8_PINS=write bash fp8/install.sh" >&2
-      exit 1
-    fi
-  done < <(grep "^$stage " "$HERE/fp8-paged/PINS")
-}
-
-# Keep the header, drop every stage line: they are about to be re-measured.
-[ "${FP8_PINS:-}" = write ] && { sed -n '/^#/p' "$HERE/fp8-paged/PINS" > "$HERE/fp8-paged/PINS.new"; }
 
 for step in "${SERIES[@]}"; do
-  case "$step" in
-    fp8-causal)
-      say "$step"
-      ( cd "$HERE/fp8-causal" && "$PY" -B test_fp8_causal_cpu.py --parent "$SP/$K" --helper "$SP/$H" >/dev/null )
-      echo "   CPU gate: OK"
-      ( cd "$HERE/fp8-causal" && "$PY" -B install_fp8_causal.py \
-          --vllm-root "$SP" --archive "$ARCHIVE/causal/parent" >/dev/null )
-      ( cd "$HERE/fp8-causal" && "$PY" -B test_fp8_causal_adapters_cpu.py >/dev/null )
-      echo "   installed, adapters: OK"
-      ;;
-    fp8-causal-r2)
-      say "$step"
-      ( cd "$HERE/fp8-causal/r2" && "$PY" -B test_fp8_causal_r2_cpu.py --r1-source "$SP/$K" >/dev/null )
-      echo "   CPU gate: OK"
-      ( cd "$HERE/fp8-causal/r2" && "$PY" -B install_fp8_causal_r2.py \
-          --vllm-root "$SP" --archive "$ARCHIVE/causal" >/dev/null )
-      ( cd "$HERE/fp8-causal/r2" && "$PY" -B test_fp8_causal_r2_adapters_cpu.py >/dev/null )
-      echo "   installed, adapters: OK"
-      ;;
-    fp8-composite)
-      say "$step"
-      ( cd "$HERE/fp8-composite" && "$PY" -B test_composite_cpu.py \
-          --vllm-root "$SP" --causal-archive "$ARCHIVE/causal" >/dev/null )
-      echo "   CPU gate: OK"
-      ( cd "$HERE/fp8-composite" && "$PY" -B install_composite.py \
-          --vllm-root "$SP" --archive "$ARCHIVE/composite" --causal-archive "$ARCHIVE/causal" >/dev/null )
-      ( cd "$HERE/fp8-composite" && "$PY" -B test_composite_cpu.py --installed \
-          --vllm-root "$SP" --archive "$ARCHIVE/composite" --causal-archive "$ARCHIVE/causal" >/dev/null )
-      echo "   installed, seal: OK"
-      ;;
-    fp8-paged)
-      say "$step"
-      pins tile-ptrs.before
-      patch -p1 --dry-run --batch --fuzz 0 -d "$SP" < "$HERE/fp8-paged/triton-fp8-paged-tile-ptrs.patch" >/dev/null
-      patch -p1 --batch --fuzz 0 -d "$SP" < "$HERE/fp8-paged/triton-fp8-paged-tile-ptrs.patch" >/dev/null
-      pins tile-ptrs.after
-      grep -Fq 'def _paged_tile_ptrs(' "$SP/$K"
-      [ "$(grep -c 'physical_block_idx\[:, None\] \* stride_v_cache_0' "$SP/$K")" = 2 ]
-      TRITON_INTERPRET=1 "$PY" -B "$HERE/fp8-paged/test_paged_tile_offsets_cpu.py" \
-        --interpret --candidate "$SP/$K" >/dev/null
-      echo "   tile-ptrs: OK"
-
-      pins v-chunked.before
-      patch -p1 --dry-run --batch --fuzz 0 -d "$SP" < "$HERE/fp8-paged/triton-fp8-v-chunked-b896.patch" >/dev/null
-      patch -p1 --batch --fuzz 0 -d "$SP" < "$HERE/fp8-paged/triton-fp8-v-chunked-b896.patch" >/dev/null
-      pins v-chunked.after
-      grep -Fq 'V_CHUNKED: tl.constexpr' "$SP/$K"
-      grep -Fq 'block_stride_v' "$SP/v1/attention/ops/triton_reshape_and_cache_flash.py"
-      grep -Fq 'def _fp8_chunked_caches(' "$SP/v1/attention/backends/triton_attn.py"
-      grep -Fq '"VLLM_TRITON_FP8_V_CHUNKED"' "$SP/envs.py"
-      [ "$(grep -c 'block_size in (880, 896)' "$SP/$K")" = 1 ]
-      [ "$(grep -c 'block_size in (880, 896)' "$SP/v1/attention/backends/triton_attn.py")" = 1 ]
-      TRITON_INTERPRET=1 "$PY" -B "$HERE/fp8-paged/test_fp8_v_chunked_cpu.py" \
-        --interpret --backend --candidate "$SITE" >/dev/null
-      echo "   v-chunked-b896: OK"
-      ;;
-    *) echo "ERROR: fp8/series names an unknown step: $step" >&2; exit 1 ;;
-  esac
+  say "$step"
+  while IFS= read -r rel; do
+    patch -p1 --batch --fuzz 0 -d "$SP" < "$HERE/$rel"
+  done < <(patches_for "$step")
 done
 
-if [ "${FP8_PINS:-}" = write ]; then
-  mv "$HERE/fp8-paged/PINS.new" "$HERE/fp8-paged/PINS"
-  echo "   fp8-paged/PINS rewritten from this tree"
-fi
+# Structural checks on the finished tree. --fuzz 0 already refused any hunk
+# whose context had moved, and each step's context is the previous step's
+# output, so a mid-sequence assertion would say nothing these do not. They name
+# themselves when they fail: under `set -e` a bare `grep -q` aborts wordlessly,
+# which is not a diagnosis.
+fail_at() { echo "ERROR: $1: $2" >&2
+            echo "       The steps applied but did not land where expected." >&2; exit 1; }
+# present at all
+have() { grep -qF -- "$2" "$SP/$1" || fail_at "$1" "not found: $2"; }
+# present exactly N times -- the two guards that say the gate was not duplicated
+count() { local n; n=$(grep -cF -- "$2" "$SP/$1")
+          [ "$n" = "$3" ] || fail_at "$1" "expected $3 of \"$2\", found $n"; }
+have "$K" 'def _paged_tile_ptrs('
+have "$K" 'V_CHUNKED: tl.constexpr'
+have v1/attention/ops/triton_reshape_and_cache_flash.py 'block_stride_v'
+have v1/attention/backends/triton_attn.py 'def _fp8_chunked_caches('
+have envs.py '"VLLM_TRITON_FP8_V_CHUNKED"'
+count "$K" 'block_size in (880, 896)' 1
+count v1/attention/backends/triton_attn.py 'block_size in (880, 896)' 1
+echo "   structure: OK"
 
 find "$SP" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+# The live registry, not the source: a hunk can land and the flag still not
+# register.
 "$PY" -c 'import vllm.envs as e
 for name, default in (("VLLM_TRITON_FP8_CAUSAL_FULL", False), ("VLLM_TRITON_FP8_PREFILL_FLAT", 0),
                       ("VLLM_TRITON_FP8_MQ3D_SEGMENTS", 16), ("VLLM_TRITON_FP8_V_CHUNKED", False)):
