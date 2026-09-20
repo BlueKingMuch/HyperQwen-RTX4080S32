@@ -70,3 +70,4 @@ block-verification-invalid-draft.patch
 # Open upstream, carried here. Cut against the tree the whole series above
 # leaves behind, so this entry stays last.
 renderer-clamp-max-tokens.patch
+bench-sse-keepalive-frames.patch
