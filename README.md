@@ -61,8 +61,8 @@ against bf16's 39.5 with 574,889 KV tokens at a 262k window; GSM8K over 200
 questions 0.945-0.955 against bf16's 0.965.
 
 **`gguf-plugin/` — the out-of-tree GGUF plugin, installed by default.** Pinned
-commit, ten patches, twenty-six Gluon decode kernels, its CUDA extension built
-for sm_89 and sm_120 at image build. None of the plugin's source is carried
+commit, ten patches, twenty-six Gluon decode kernels (eleven tile types on the
+grouped one), its CUDA extension built for sm_89 and sm_120 at image build. None of the plugin's source is carried
 here; `install.sh` fetches the archive and checks its sha256. It costs nothing at
 run time until a `MODEL=` path ends in `.gguf`, which is the whole of the
 plugin's claim on a model. The weights are not produced by this repository.

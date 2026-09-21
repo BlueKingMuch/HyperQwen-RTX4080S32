@@ -20,7 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
-# ggml type -> (block bytes, the tile row's bytes, d moved behind the block's other bytes)
+# ggml type -> (block bytes, the tile row's bytes, d moved behind the block's other bytes; None: the layout of kq_tiles.py)
 TILE_TYPES = {
     21: (110, 112, True),    # IQ3_S (0036: qs, qh, signs, scales, d, 2 bytes of padding)
     23: (136, 136, False),   # IQ4_XS
@@ -29,6 +29,10 @@ TILE_TYPES = {
     16: (66, 68, True),      # IQ2_XXS
     17: (74, 76, True),      # IQ2_XS
     22: (82, 84, True),      # IQ2_S
+    11: (110, 112, None),    # Q3_K: the block as it is (d is its last field), 2 bytes of padding
+    13: (176, 176, None),    # Q5_K: the block as it is
+    14: (210, 216, None),    # Q6_K: two stages per k-block, 108 bytes each (its half: ql, qh, scales, d, 2 bytes of padding)
+    8: (272, 272, None),     # Q8_0: eight 34-byte blocks per k-block, two stages of four (qs x 4, d x 4)
 }
 
 
@@ -51,6 +55,8 @@ def _unrepack_kernel(T, R, n_out, nb, BLOCK: tl.constexpr, ROW_BYTES: tl.constex
 
 def unrepack_tiles(tiles: torch.Tensor, n_out: int, weight_type: int) -> torch.Tensor:
     """tiles uint8 [n_tiles, nb, 64, row_bytes] of the type -> the raw rows uint8 [n_out, nb * block]."""
+    if weight_type in KQ_TYPES:
+        return unrepack_kq(tiles, n_out, weight_type)
     block, row_bytes, d_last = TILE_TYPES[weight_type]
     assert tiles.dtype == torch.uint8 and tiles.is_contiguous() and tiles.dim() == 4 and tiles.shape[2] == 64 and tiles.shape[3] == row_bytes
     n_tiles, nb = int(tiles.shape[0]), int(tiles.shape[1])
@@ -63,6 +69,8 @@ def unrepack_tiles(tiles: torch.Tensor, n_out: int, weight_type: int) -> torch.T
 
 def unrepack_tiles_torch(tiles: torch.Tensor, n_out: int, weight_type: int) -> torch.Tensor:
     """The same in torch ops (the reference; any device)."""
+    if weight_type in KQ_TYPES:
+        return unrepack_kq_torch(tiles, n_out, weight_type)
     block, row_bytes, d_last = TILE_TYPES[weight_type]
     assert tiles.dtype == torch.uint8 and tiles.dim() == 4 and tiles.shape[2] == 64 and tiles.shape[3] == row_bytes
     t = tiles.permute(0, 2, 1, 3).reshape(-1, tiles.shape[1], row_bytes)[:n_out]
@@ -79,6 +87,7 @@ from .iq3s_tile_dequant import dequantize_iq3s_tiles  # noqa: E402
 from .iq3xxs_int8t import iq3xxs_int8t_gemm, repack_iq3xxs_tiles  # noqa: E402
 from .iq4xs_int8t import iq4xs_int8t_gemm, repack_iq4xs_tiles  # noqa: E402
 from .q4k_int8t import q4k_int8t_gemm, repack_q4k_tiles  # noqa: E402
+from .kq_tiles import KQ_TYPES, repack as repack_kq, single_gemm as kq_single_gemm, unrepack as unrepack_kq, unrepack_torch as unrepack_kq_torch  # noqa: E402
 
 GGML_TYPE_Q4_K = 12
 GGML_TYPE_IQ3_XXS = 18
@@ -104,6 +113,15 @@ _GEMM = {
 }
 for _t in (GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S):
     _REPACK[_t], _GEMM[_t] = _iq2(_t)
+
+
+def _kq(t):
+    # the K-quant / Q8_0 types: served only by the grouped kernel; the registry's launcher runs it on the one shard
+    return (lambda w, n: repack_kq(w, n, t), lambda wt, x, n, quantized=None, out=None: kq_single_gemm(wt, x, n, t, quantized=quantized, out=out))
+
+
+for _t in sorted(KQ_TYPES):
+    _REPACK[_t], _GEMM[_t] = _kq(_t)
 assert set(_REPACK) == set(_GEMM) == set(TILE_TYPES)
 
 

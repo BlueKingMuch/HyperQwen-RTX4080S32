@@ -233,19 +233,37 @@ def check_bridge() -> None:
         fail("the tiles op's prefill branch (0037)")
     from vllm_gguf_plugin.triton.gluon import iq2_int8t, iq3xxs_int8t, iq4xs_int8t, q4k_int8t, tiles  # noqa: F401  (0038: the other six types' tile-major forms import)
 
-    if set(tiles.TILE_TYPES) != {21, 23, 12, 18, 16, 17, 22} or set(gi.GLUON_TILE_TYPES) != set(tiles.TILE_TYPES) or not callable(getattr(gi, "gluon_mul_mat_tiles", None)):
+    if set(tiles.TILE_TYPES) != {21, 23, 12, 18, 16, 17, 22, 8, 11, 13, 14} or set(gi.GLUON_TILE_TYPES) != set(tiles.TILE_TYPES) or not callable(getattr(gi, "gluon_mul_mat_tiles", None)):
         fail("the tile types' registry (0038)")
     if "dequantize_tiles(tiles, n_out, x.shape[1], weight_type, x.dtype)" not in _inspect.getsource(gi.gluon_mul_mat_tiles):
         fail("the tiles op's prefill branch (0038)")
     for wt, (block, row_bytes, d_last) in tiles.TILE_TYPES.items():
         raw = torch.arange(70 * 3 * block, dtype=torch.int32).remainder(251).to(torch.uint8).reshape(70, 3 * block)
         tt = tiles.repack_tiles(raw, 70, wt)
-        if tuple(tt.shape) != (2, 3, 64, row_bytes) or not torch.equal(tiles.unrepack_tiles_torch(tt, 70, wt), raw) or int(tt[1, :, 6:, :].sum()) != 0:
+        if d_last is None:   # the stage-major layouts (kq_tiles): the rows past 70 sit inside every stage
+            from vllm_gguf_plugin.triton.gluon import kq_tiles as _kq
+
+            pad = tt.reshape(2, 3, _kq.NST[wt], 64, row_bytes // _kq.NST[wt])[1, :, :, 6:, :]
+        else:
+            pad = tt[1, :, 6:, :]
+        if tuple(tt.shape) != (2, 3, 64, row_bytes) or not torch.equal(tiles.unrepack_tiles_torch(tt, 70, wt), raw) or int(pad.sum()) != 0:
             fail(f"the tile repack / un-repack round trip of type {wt} (0038)")
-        if d_last and not (torch.equal(tt[0, 1, 5, block - 2:block], raw[5, block:block + 2]) and torch.equal(tt[0, 1, 5, :block - 2], raw[5, block + 2:2 * block]) and int(tt[0, 1, 5, block:].sum()) == 0):
+        if d_last is True and not (torch.equal(tt[0, 1, 5, block - 2:block], raw[5, block:block + 2]) and torch.equal(tt[0, 1, 5, :block - 2], raw[5, block + 2:2 * block]) and int(tt[0, 1, 5, block:].sum()) == 0):
             fail(f"the d-last tile layout of type {wt} (0038)")
-        if not d_last and not torch.equal(tt[0, 1, 5, :block], raw[5, block:2 * block]):
+        if d_last is False and not torch.equal(tt[0, 1, 5, :block], raw[5, block:2 * block]):
             fail(f"the tile layout of type {wt} (0038)")
+        if d_last is None:
+            # the K-quant / Q8_0 layouts: stage-major, tile byte j of stage h of row 5 (k-block 1) is block byte tile_map[h * hb + j]
+            from vllm_gguf_plugin.triton.gluon import kq_tiles
+
+            nst, hb = kq_tiles.NST[wt], row_bytes // kq_tiles.NST[wt]
+            m = kq_tiles.tile_map(wt)
+            view = tt.reshape(tt.shape[0], tt.shape[1], nst, 64, hb)
+            if (
+                len(m) != row_bytes or sorted(set(k for k in m if k >= 0)) != list(range(block)) or kq_tiles.BLOCK_BYTES[wt] != block or kq_tiles.ROW_BYTES[wt] != row_bytes
+                or not all(int(view[0, 1, h, 5, j]) == (int(raw[5, block + m[h * hb + j]]) if m[h * hb + j] >= 0 else 0) for h in range(nst) for j in range(hb))
+            ):
+                fail(f"the stage-major tile layout of type {wt} (kq_tiles)")
     from vllm_gguf_plugin.triton.gluon import splitk_reduce  # noqa: F401  (0039: the in-kernel split-K reduction imports)
 
     for _g in (iq3s_int8t.iq3s_int8t_gemm, iq4xs_int8t.iq4xs_int8t_gemm, q4k_int8t.q4k_int8t_gemm, iq3xxs_int8t.iq3xxs_int8t_gemm, iq2_int8t.iq2_int8t_gemm):
@@ -304,6 +322,39 @@ def check_bridge() -> None:
         ):
             fail(f"the split partition at {sk} splits (0044)")
 
+    # the K-quant / Q8_0 tile types (kq_tiles.py): grouped-kernel only - the stage rows, the NEW mask, the wide regions, the dispatch
+    from vllm_gguf_plugin.triton.gluon import kq_tiles, kq_ref  # noqa: F401  (the layouts and the CPU reference models import)
+
+    _txtkq = open(tiles_grouped.__file__, encoding="utf-8").read()
+    if (
+        kq_tiles.NST != {8: 2, 11: 1, 13: 1, 14: 2} or kq_tiles.NEW_BIT != {8: 1, 11: 2, 13: 4, 14: 8}
+        or {wt: tiles_grouped.STAGE_ROW_WORDS[wt] for wt in (8, 11, 13, 14, 12, 21)} != {8: 34, 11: 28, 13: 44, 14: 27, 12: 36, 21: 28}
+        or tiles_grouped.STAGE_WIDE != 2816 or tiles_grouped.REGIONS[5]["stage"] != 2816 or tiles_grouped.REGIONS[6]["aoff"] != 6144 or tiles_grouped.REGIONS[7]["stage"] != 2816
+        or any(f"if NEW & {b}:" not in _txtkq or f"_run({wt}, {tiles_grouped.ROW_WORDS[wt]}, {kq_tiles.NST[wt]}, E," not in _txtkq for wt, b in kq_tiles.NEW_BIT.items())
+        or "for h in gl.static_range(NST):" not in _txtkq or "region = {0: 5, 1: 6, 3: 7}[region]" not in _inspect.getsource(tiles_grouped.grouped_gemm)
+        or "STAGE_ROW_WORDS[wt] for wt in weight_types" not in _inspect.getsource(gi.gluon_mul_mat_tiles_grouped)
+    ):
+        fail("the K-quant / Q8_0 tile types (kq_tiles)")
+    # a packed layer with a Q6_K shard: the descriptor's row words are the k-block's (54), the region choice reads the stage row (27)
+    raw14 = torch.arange(70 * 3 * 210, dtype=torch.int32).remainder(251).to(torch.uint8).reshape(70, 3 * 210)
+    t14 = tiles.repack_tiles(raw14, 70, 14)
+    p14, v14, d14, s14, nb14, bb14 = tiles_grouped.prepare_grouped_layer([t21, t14], [70, 70], [21, 14])
+    d14_1 = d14[s14.index(1)]
+    if tuple(t14.shape) != (2, 3, 64, 216) or d14_1[:, 1].tolist() != [21, 21, 14, 14] or d14_1[:, 2].tolist() != [28, 28, 54, 54] or d14_1[:, 8].tolist() != [64 * 28, 64 * 28, 64 * 54, 64 * 54] or bb14 != 300 or not torch.equal(v14[1], t14):
+        fail("the packed layer with a Q6_K shard (kq_tiles)")
+    # the CPU reference models reproduce gguf-py's dequantiser on random blocks of every type
+    import numpy as np
+    from gguf.quants import dequantize as _gg_deq
+    from gguf.constants import GGMLQuantizationType as _GT
+
+    _rng = np.random.default_rng(3)
+    for wt in (8, 11, 13, 14):
+        _raw = kq_ref.random_rows(_rng, 6, 512, wt)
+        if not np.array_equal(kq_ref.dequantize(kq_ref.parse(_raw, wt)), _gg_deq(_raw, _GT(wt)).reshape(6, 512)):
+            fail(f"the CPU reference model of type {wt} against gguf.quants (kq_ref)")
+        if not torch.equal(tiles.unrepack_tiles_torch(tiles.repack_tiles(torch.from_numpy(_raw), 6, wt), 6, wt), torch.from_numpy(_raw)):
+            fail(f"the repack round trip of type {wt} on random rows (kq_tiles)")
+
     if (
         not {21, 23, 18, 12, 22, 17, 16} <= set(gi.GLUON_INT8_TYPES)
         or (iq3s_int8.BLOCK_BYTES, iq4xs_int8.BLOCK_BYTES, iq3xxs_int8.BLOCK_BYTES, q4k_int8.BLOCK_BYTES) != (110, 136, 98, 144)
@@ -346,7 +397,7 @@ def check_bridge() -> None:
     if _p46[3] != sorted({tiles_grouped.grouped_split_for(3, 3, m=m, block_bytes=_p46[5]) for m in range(1, 33)}) or any(
             tiles_grouped.grouped_split_for(3, 3, m=m, block_bytes=_p46[5]) != tiles_grouped.grouped_split_for(3, 3, m=16, block_bytes=_p46[5]) for m in (17, 24, 32)):
         fail("the split tables to 32 rows, the 16-row split above 16 (0046)")
-    print("gluon (0024 + 0025 + 0028 + 0030 + 0031 + 0032 + 0033 + 0034 + 0035 + 0036 + 0037 + 0038 + 0039 + 0040 + 0041 + 0042 + 0043 + 0044 + 0046): the decode kernels of all eight matmul types are installed and dispatched at up to 16 rows (32 on row halves); every type but Q2_K tile-major only and through the grouped kernel (one op, one launch per layer; per-256 activations on every type); the split-K from the measured tables, capped per batch")
+    print("gluon (0024 + 0025 + 0028 + 0030 + 0031 + 0032 + 0033 + 0034 + 0035 + 0036 + 0037 + 0038 + 0039 + 0040 + 0041 + 0042 + 0043 + 0044 + 0046 + kq): the decode kernels of all eight matmul types of the IQ3_S file are installed and dispatched at up to 16 rows (32 on row halves); every type but Q2_K tile-major only and through the grouped kernel (one op, one launch per layer; per-256 activations on every type), Q3_K / Q5_K / Q6_K / Q8_0 tile-major through the same kernel; the split-K from the measured tables, capped per batch")
 
 
 def main() -> int:
