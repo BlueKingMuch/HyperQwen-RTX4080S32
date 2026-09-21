@@ -128,7 +128,7 @@ is why it goes last:
 |---|---|---|---|
 | `kvarn/install.sh` | feature | the KVarN KV cache, two patches plus its modules | two rows above; `verify.sh` reverse-dry-runs both patches |
 | `fp8/install.sh` | feature | four FP8 Triton attention steps, all off by default (`fp8/README.md`) | each step pins what it reads and proves its output reverses to its parent; `verify.sh` re-derives the published seal from the archived parents |
-| `gguf-plugin/install.sh` | feature | the out-of-tree GGUF plugin at a pinned commit, ten patches, twenty-six Gluon decode kernels | three hash gates (`gguf-plugin/README.md`); `verify.sh` checks the package, its extension and its model test |
+| `gguf-plugin/install.sh` | feature | the out-of-tree GGUF plugin at a pinned commit, ten patches, twenty-six Gluon decode kernels (eleven tile types on the grouped one) | three hash gates (`gguf-plugin/README.md`); `verify.sh` checks the package, its extension and its model test |
 
 `fp8/` is where the FP8 attention flags come from that `patches/triton-fp8-mq3d-qmax8.patch` and
 `patches/mq3d-mixed-target.patch` above only half describe: those two register `VLLM_TRITON_FP8_MQ3D` and

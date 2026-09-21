@@ -29,6 +29,12 @@ on IQ3_S).
 This module adds the latency hiding, pack_tiles (the loader's tiles) and
 prepare_grouped_layer (the loader's step).
 
+The K-quant and Q8_0 types (kq_tiles.py: Q3_K, Q5_K, Q6_K, Q8_0) are branches of the same kernel, compiled
+into a launch only when the layer holds one (the NEW mask). Q6_K and Q8_0 do not fit a stage as a k-block
+and take two stages per k-block (NST 2: the block's halves in turn, the pipeline one stage ahead); Q5_K's
+44-word row takes the 2,816-word stages (regions 5-7, the shapes of 0 / 1 / 3). Q3_K and Q6_K carry a scale
+per 16 and run the two halves of a sub-block on their own mma as IQ2_XS does.
+
 The 32-row form: BM a launch-time choice of 16
 or 32 (bm); at 32 every warp issues two mma row blocks per decoded B fragment, so a verify batch of 17-32 rows
 (three or four streams under the 7-token drafter) streams the weights once instead of twice; the AMODE-2 A
@@ -59,6 +65,7 @@ from .iq3xxs import grid32 as grid32_iq3xxs
 from .iq3xxs_int8t import repack_iq3xxs_tiles
 from .iq4xs_int8 import T0, T1, T2, T3, _kvalues_lookup
 from .iq4xs_int8t import _lds_v, repack_iq4xs_tiles
+from .kq_tiles import KQ_TYPES, NEW_BIT, NST as KQ_NST, repack as repack_kq
 from .q4k_int8t import repack_q4k_tiles
 from .splitk import PARTIALS_BUDGET
 from .tiles import TILE_TYPES
@@ -77,12 +84,17 @@ SMEM_WORDS = 2 * STAGE   # two allocations of 4096 + 512 words (the compiler's s
 REGIONS = {0: dict(stage=2304, tab=1792, tabx=1600, aoff=0), 1: dict(stage=2304, tab=1792, tabx=1600, aoff=6144), 2: dict(stage=1792, tab=3584, tabx=3584, aoff=4096),
            # 0046: the 32-row A stages (2 x 32 x 64 words) in the second allocation - 3 the [8192] + [4096] region (48 KB, two
            # blocks) for layers with an IQ4_XS or Q4_K shard, 4 the compact [4096] + [4096] region (32 KB, three blocks)
-           3: dict(stage=2304, tab=1792, tabx=1600, aoff=0), 4: dict(stage=1792, tab=3584, tabx=3584, aoff=0)}
+           3: dict(stage=2304, tab=1792, tabx=1600, aoff=0), 4: dict(stage=1792, tab=3584, tabx=3584, aoff=0),
+           # the wide stages (2,816 words) for a layer with a Q5_K shard: 5 the [4096] + [2048] region (24 KB, four blocks) as 0,
+           # 6 the [8192] region with the A stages at 6144 as 1, 7 the [8192] + [4096] region as 3
+           5: dict(stage=2816, tab=1792, tabx=1600, aoff=0), 6: dict(stage=2816, tab=1792, tabx=1600, aoff=6144), 7: dict(stage=2816, tab=1792, tabx=1600, aoff=0)}
 DESC_W = 16            # int32 words per descriptor row
 # the descriptor row
 D_OFF, D_TYPE, D_RW, D_COL0, D_NVALID, D_KB0, D_KB1, D_SPLIT, D_TW = range(9)
-ROW_WORDS = {wt: rb // 4 for wt, (_, rb, _) in TILE_TYPES.items()}
-assert all(64 * rw <= STAGE and (64 * rw <= 2048 or (64 * rw - 2048) % 128 == 0) for rw in ROW_WORDS.values())   # IQ4_XS 2176, Q4_K 2304
+ROW_WORDS = {wt: rb // 4 for wt, (_, rb, _) in TILE_TYPES.items()}                 # words per row of a k-block
+STAGE_ROW_WORDS = {wt: rw // KQ_NST.get(wt, 1) for wt, rw in ROW_WORDS.items()}   # words per row of a stage (Q6_K, Q8_0: one stage per half k-block)
+STAGE_WIDE = 2816      # the wide stage (Q5_K, 44 words x 64 rows): regions 5-7, the shapes of regions 0 / 1 / 3 with the stages 2,816 apart
+assert all(64 * sw <= STAGE_WIDE and (64 * sw <= 2048 or (64 * sw - 2048) % 128 == 0) for sw in STAGE_ROW_WORDS.values())   # IQ4_XS 2176, Q4_K 2304, Q5_K 2816
 
 
 # ---- the activations per 256 (the sixth form's convention), with the int32 sums per 32 for the K types' mins
@@ -153,6 +165,8 @@ def _repack(W: torch.Tensor, n_out: int, wt: int) -> torch.Tensor:
         return repack_q4k_tiles(W, n_out, 144)
     if wt == GGML_TYPE_IQ3_XXS:
         return repack_iq3xxs_tiles(W, n_out, 100)
+    if wt in KQ_TYPES:
+        return repack_kq(W, n_out, wt)
     return repack_iq2_tiles(W, n_out, wt)
 
 
@@ -172,7 +186,7 @@ def pack_tiles(shards: list[tuple[torch.Tensor, int, int]]):
         base_words += t.numel() // 4
         col0 += n_out
     packed = torch.cat(parts)
-    return packed, {"shards": meta, "nb": nb, "n_total": col0, "words": base_words, "max_rw": max(m[2] for m in meta)}
+    return packed, {"shards": meta, "nb": nb, "n_total": col0, "words": base_words, "max_rw": max(STAGE_ROW_WORDS[m[1]] for m in meta)}
 
 
 def pack_layer(shards: list[tuple[torch.Tensor, int, int]]):
@@ -318,15 +332,18 @@ def _decode_half_iq3s(qsw, qh, sgw, selq, shq, shs, zero4, tbase):
 
 
 @g.jit
-def _run(TP: gl.constexpr, RW: gl.constexpr, E: gl.constexpr, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split,
+def _run(TP: gl.constexpr, RW: gl.constexpr, NST: gl.constexpr, E: gl.constexpr, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split,
          XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
          M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk,
          BM: gl.constexpr, BN: gl.constexpr, STAGE_: gl.constexpr, TAB: gl.constexpr,
          K0: gl.constexpr, K1: gl.constexpr, K2: gl.constexpr, K3: gl.constexpr,
          AMODE: gl.constexpr, STAGES: gl.constexpr, GX: gl.constexpr, REGION: gl.constexpr, TABX: gl.constexpr, AOFF: gl.constexpr):
-    """One CTA's tile of type TP (RW words per row): the k-loop over kb0..kb1 on the two-stage pipeline, the
-    decode of TP, the epilogue store into the layer's output columns col0.. (or the split's partial)."""
-    TW: gl.constexpr = 64 * RW
+    """One CTA's tile of type TP (RW words per row, NST stages per k-block): the k-loop over kb0..kb1 on the
+    two-stage pipeline, the decode of TP, the epilogue store into the layer's output columns col0.. (or the
+    split's partial)."""
+    TW: gl.constexpr = 64 * RW            # the k-block's tile words
+    HW: gl.constexpr = TW // NST          # the words of one stage: the tile, or its half (Q6_K, Q8_0)
+    RWS: gl.constexpr = RW // NST         # the row stride inside a stage
     mma: gl.constexpr = NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8])
     da8: gl.constexpr = DotOperandLayout(0, mma, 4)
     db8: gl.constexpr = DotOperandLayout(1, mma, 4)
@@ -342,7 +359,7 @@ def _run(TP: gl.constexpr, RW: gl.constexpr, E: gl.constexpr, smem, smem2, TILES
     Lrow4: gl.constexpr = SliceLayout(1, L4)
     Lrow_c: gl.constexpr = SliceLayout(0, mma)
 
-    NC: gl.constexpr = 1024 if TW > 2048 else 512
+    NC: gl.constexpr = 1024 if HW > 2048 else 512
     cc: gl.constexpr = BlockedLayout([1], [32], [4], [0])
     ic = gl.arange(0, NC, layout=cc)
     sb = _smem_base(ic)
@@ -361,12 +378,13 @@ def _run(TP: gl.constexpr, RW: gl.constexpr, E: gl.constexpr, smem, smem2, TILES
     rwv = gl.arange(0, 64, layout=Lrow_w)
     rcv = gl.arange(0, 64, layout=Lrow_c)
     r4v = gl.arange(0, 64, layout=Lrow4)
-    aw = _smem_base(rwv) + rwv * (RW * 4)
-    ac = _smem_base(rcv) + rcv * (RW * 4)
-    a4 = _smem_base(r4v) + r4v * (RW * 4)
+    aw = _smem_base(rwv) + rwv * (RWS * 4)
+    ac = _smem_base(rcv) + rcv * (RWS * 4)
+    a4 = _smem_base(r4v) + r4v * (RWS * 4)
     r2 = gl.arange(0, 64, layout=SliceLayout(1, Lw))
     c2 = gl.arange(0, 8, layout=SliceLayout(0, Lw))
-    a2 = _smem_base(r2)[:, None] + (r2[:, None] * RW + 4 + c2[None, :]) * 4
+    a2 = _smem_base(r2)[:, None] + (r2[:, None] * RWS + 4 + c2[None, :]) * 4
+    a2z = _smem_base(r2)[:, None] + (r2[:, None] * RWS + c2[None, :]) * 4       # the same gather from word 0 (the K-quant / Q8_0 planes)
     bidx = gl.arange(0, 8, layout=SliceLayout(0, Lw))
     zero2 = gl.zeros([64, 8], gl.int32, Lw)
     b2 = zero2 + bidx[None, :]
@@ -396,403 +414,637 @@ def _run(TP: gl.constexpr, RW: gl.constexpr, E: gl.constexpr, smem, smem2, TILES
         amask = (am < M)[:, None] & (aw_ < 64)[None, :]
         if REGION == 1:
             smem_a = smem.slice(AOFF, 2048)._reinterpret(gl.int32, [2, BM, 64], smem_a_words)
+        elif REGION == 6:
+            smem_a = smem.slice(AOFF, 2048)._reinterpret(gl.int32, [2, BM, 64], smem_a_words)
         else:
             smem_a = smem2._reinterpret(gl.int32, [2, BM, 64], smem_a_words)
 
     acc = gl.zeros([BM, BN], gl.float32, mma)
     ntiles = kb1 - kb0
-    _copy_stage(sb, 0, base + kb0 * TW, ic, TW, STAGE_)
+    _copy_stage(sb, 0, base + kb0 * TW, ic, HW, STAGE_)
     if AMODE == 2:
         async_copy.async_copy_global_to_shared(smem_a.index(0), XQ32 + arow[:, None] + (kb0 * 64 + aw_)[None, :], amask)
     async_copy.commit_group()
     if STAGES == 3:
         if ntiles > 1:
-            _copy_stage(sb, 1, base + (kb0 + 1) * TW, ic, TW, STAGE_)
+            _copy_stage(sb, 1, base + (kb0 + 1) * TW, ic, HW, STAGE_)
         async_copy.commit_group()
     for it in range(0, ntiles):
         kb = kb0 + it
-        if STAGES == 3:
-            if it + 2 < ntiles:
-                _copy_stage(sb, (it + 2) % 3, base + (kb + 2) * TW, ic, TW, STAGE_)
-                async_copy.commit_group()
-                async_copy.wait_group(2)
-            elif it + 1 < ntiles:
-                async_copy.wait_group(1)
+        # the stages of the k-block: the tile (NST 1), or its two halves in turn (NST 2); the prefetch one stage ahead
+        for h in gl.static_range(NST):
+            if STAGES == 3:
+                if it + 2 < ntiles:
+                    _copy_stage(sb, (it + 2) % 3, base + (kb + 2) * TW, ic, HW, STAGE_)
+                    async_copy.commit_group()
+                    async_copy.wait_group(2)
+                elif it + 1 < ntiles:
+                    async_copy.wait_group(1)
+                else:
+                    async_copy.wait_group(0)
             else:
-                async_copy.wait_group(0)
-        else:
-            if it + 1 < ntiles:
-                _copy_stage(sb, (it + 1) % 2, base + (kb + 1) * TW, ic, TW, STAGE_)
+                if h + 1 < NST:
+                    _copy_stage(sb, (NST * it + h + 1) % 2, base + kb * TW + (h + 1) * HW, ic, HW, STAGE_)
+                    async_copy.commit_group()
+                    async_copy.wait_group(1)
+                elif it + 1 < ntiles:
+                    _copy_stage(sb, (NST * (it + 1)) % 2, base + (kb + 1) * TW, ic, HW, STAGE_)
+                    if AMODE == 2:
+                        async_copy.async_copy_global_to_shared(smem_a.index((it + 1) % 2), XQ32 + arow[:, None] + ((kb + 1) * 64 + aw_)[None, :], amask)
+                    async_copy.commit_group()
+                    async_copy.wait_group(1)
+                else:
+                    async_copy.wait_group(0)
+            gl.barrier()
+            if STAGES == 3:
+                so = (it % 3) * (STAGE_ * 4)
+            else:
+                so = ((NST * it + h) % 2) * (STAGE_ * 4)
+            if h == 0:
+                if AMODE == 1:
+                    # the eight fragments of this k-block, loaded together ahead of the decode (one latency per k-block)
+                    af0 = gl.load(xrow + (kb * 256 + 0 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    af1 = gl.load(xrow + (kb * 256 + 1 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    af2 = gl.load(xrow + (kb * 256 + 2 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    af3 = gl.load(xrow + (kb * 256 + 3 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    af4 = gl.load(xrow + (kb * 256 + 4 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    af5 = gl.load(xrow + (kb * 256 + 5 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    af6 = gl.load(xrow + (kb * 256 + 6 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    af7 = gl.load(xrow + (kb * 256 + 7 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
                 if AMODE == 2:
-                    async_copy.async_copy_global_to_shared(smem_a.index((it + 1) % 2), XQ32 + arow[:, None] + ((kb + 1) * 64 + aw_)[None, :], amask)
-                async_copy.commit_group()
-                async_copy.wait_group(1)
-            else:
-                async_copy.wait_group(0)
-        gl.barrier()
-        so = (it % STAGES) * (STAGE_ * 4)
-        if AMODE == 1:
-            # the eight fragments of this k-block, loaded together ahead of the decode (one latency per k-block)
-            af0 = gl.load(xrow + (kb * 256 + 0 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-            af1 = gl.load(xrow + (kb * 256 + 1 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-            af2 = gl.load(xrow + (kb * 256 + 2 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-            af3 = gl.load(xrow + (kb * 256 + 3 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-            af4 = gl.load(xrow + (kb * 256 + 4 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-            af5 = gl.load(xrow + (kb * 256 + 5 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-            af6 = gl.load(xrow + (kb * 256 + 6 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-            af7 = gl.load(xrow + (kb * 256 + 7 * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-        if AMODE == 2:
-            a_tile = smem_a.index(it % 2)._reinterpret(gl.int8, [BM, 256], smem_a8)
-        if E == 1:
-            sx = gl.load(sxrow + kb, mask=ms_ok, other=0.0)                       # the activation scale per 256
-            acc_k = gl.zeros([BM, BN], gl.int32, mma)
-        if TP == 21:
-            # IQ3_S: qs words 0-15, qh 16-17, signs 18-25, scales 26, d 27 (the 0036 tile row)
-            qh01 = _lds_v(a4 + so + 16 * 4)
-            qh23 = _lds_v(a4 + so + 17 * 4)
-            dw = _lds_v(ac + so + 27 * 4)
-            d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
-            scw = _lds_v(ac + so + 26 * 4)
-            for ib in gl.static_range(8):
-                if AMODE == 0:
-                    a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-                elif AMODE == 1:
-                    if ib == 0:
-                        a8 = af0
-                    elif ib == 1:
-                        a8 = af1
-                    elif ib == 2:
-                        a8 = af2
-                    elif ib == 3:
-                        a8 = af3
-                    elif ib == 4:
-                        a8 = af4
-                    elif ib == 5:
-                        a8 = af5
-                    elif ib == 6:
-                        a8 = af6
-                    else:
-                        a8 = af7
-                else:
-                    a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
-                qsw0 = _lds_v(a4 + so + (2 * ib) * 4)
-                qsw1 = _lds_v(a4 + so + (2 * ib + 1) * 4)
-                sgw = _lds_v(a4 + so + (18 + ib) * 4)
-                if ib < 4:
-                    qh = (qh01 >> (8 * ib)) & 0xFF
-                else:
-                    qh = (qh23 >> (8 * (ib - 4))) & 0xFF
-                wq_lo = _decode_half_iq3s(qsw0, qh, sgw, b4 | 0x4440, 8 - b4, 4 * b4, zero4, tbase)
-                wq_hi = _decode_half_iq3s(qsw1, qh, sgw, b4 | 0x4440, 4 - b4, 16 + 4 * b4, zero4, tbase)
-                w8 = gl.join(wq_lo, wq_hi)
-                w4 = _word_to_i8x4(gl.join(gl.join(w8, w8), gl.join(w8, w8)))
-                b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (2, 1, 3, 4, 0)), [32, 64]), db8)
-                acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
-                s = (scw >> (4 * ib)) & 0xF
+                    a_tile = smem_a.index(it % 2)._reinterpret(gl.int8, [BM, 256], smem_a8)
                 if E == 1:
-                    si = 1 + 2 * s
-                    acc_k = acc_k + acc_i * si[None, :]
-                else:
-                    sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
-                    dl = d * (1.0 + 2.0 * s.to(gl.float32))
-                    acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :])
-            if E == 1:
-                acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :])
-        elif TP == 23:
-            # IQ4_XS: d | scales_h (word 0), scales_l (word 1), qs words 2-33
-            w0 = _lds_v(ac + so)
-            slw = _lds_v(ac + so + 4)
-            d = (w0 & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
-            shw = (w0 >> 16) & 0xFFFF
-            nsh2 = (b2 >> 2) * 4
-            for ib in gl.static_range(8):
-                if AMODE == 0:
-                    a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-                elif AMODE == 1:
-                    if ib == 0:
-                        a8 = af0
-                    elif ib == 1:
-                        a8 = af1
-                    elif ib == 2:
-                        a8 = af2
-                    elif ib == 3:
-                        a8 = af3
-                    elif ib == 4:
-                        a8 = af4
-                    elif ib == 5:
-                        a8 = af5
-                    elif ib == 6:
-                        a8 = af6
+                    sx = gl.load(sxrow + kb, mask=ms_ok, other=0.0)                       # the activation scale per 256
+                    acc_k = gl.zeros([BM, BN], gl.int32, mma)
+            if TP == 21:
+                # IQ3_S: qs words 0-15, qh 16-17, signs 18-25, scales 26, d 27 (the 0036 tile row)
+                qh01 = _lds_v(a4 + so + 16 * 4)
+                qh23 = _lds_v(a4 + so + 17 * 4)
+                dw = _lds_v(ac + so + 27 * 4)
+                d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                scw = _lds_v(ac + so + 26 * 4)
+                for ib in gl.static_range(8):
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if ib == 0:
+                            a8 = af0
+                        elif ib == 1:
+                            a8 = af1
+                        elif ib == 2:
+                            a8 = af2
+                        elif ib == 3:
+                            a8 = af3
+                        elif ib == 4:
+                            a8 = af4
+                        elif ib == 5:
+                            a8 = af5
+                        elif ib == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
                     else:
-                        a8 = af7
-                else:
-                    a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
-                q0 = _lds_v(aw + so + (2 + 4 * ib) * 4)
-                q1 = _lds_v(aw + so + (3 + 4 * ib) * 4)
-                q2 = _lds_v(aw + so + (4 + 4 * ib) * 4)
-                q3 = _lds_v(aw + so + (5 + 4 * ib) * 4)
-                q0_2 = zero2 + q0[:, None]
-                q1_2 = zero2 + q1[:, None]
-                q2_2 = zero2 + q2[:, None]
-                q3_2 = zero2 + q3[:, None]
-                bl = b2 & 3
-                qw = gl.where(bl == 0, q0_2, gl.where(bl == 1, q1_2, gl.where(bl == 2, q2_2, q3_2)))
-                nib4 = (qw >> nsh2) & 0x0F0F0F0F
-                wq = _kvalues_lookup(nib4, K0, K1, K2, K3)
-                w4 = _word_to_i8x4(gl.join(gl.join(wq, wq), gl.join(wq, wq)))
-                b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (1, 2, 3, 0)), [32, 64]), db8)
-                acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
-                ls = ((slw >> (4 * ib)) & 0xF) | (((shw >> (2 * ib)) & 3) << 4)
+                        a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
+                    qsw0 = _lds_v(a4 + so + (2 * ib) * 4)
+                    qsw1 = _lds_v(a4 + so + (2 * ib + 1) * 4)
+                    sgw = _lds_v(a4 + so + (18 + ib) * 4)
+                    if ib < 4:
+                        qh = (qh01 >> (8 * ib)) & 0xFF
+                    else:
+                        qh = (qh23 >> (8 * (ib - 4))) & 0xFF
+                    wq_lo = _decode_half_iq3s(qsw0, qh, sgw, b4 | 0x4440, 8 - b4, 4 * b4, zero4, tbase)
+                    wq_hi = _decode_half_iq3s(qsw1, qh, sgw, b4 | 0x4440, 4 - b4, 16 + 4 * b4, zero4, tbase)
+                    w8 = gl.join(wq_lo, wq_hi)
+                    w4 = _word_to_i8x4(gl.join(gl.join(w8, w8), gl.join(w8, w8)))
+                    b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (2, 1, 3, 4, 0)), [32, 64]), db8)
+                    acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
+                    s = (scw >> (4 * ib)) & 0xF
+                    if E == 1:
+                        si = 1 + 2 * s
+                        acc_k = acc_k + acc_i * si[None, :]
+                    else:
+                        sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        dl = d * (1.0 + 2.0 * s.to(gl.float32))
+                        acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :])
                 if E == 1:
-                    si = ls - 32
-                    acc_k = acc_k + acc_i * si[None, :]
-                else:
-                    sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
-                    dl = d * (ls.to(gl.float32) - 32.0)
-                    acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :])
-            if E == 1:
-                acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :])
-        elif TP == 12:
-            # Q4_K: d | dmin (word 0), scale / min bytes (words 1-3), qs words 4-35
-            w0 = _lds_v(ac + so)
-            sw1 = _lds_v(ac + so + 4)
-            sw2 = _lds_v(ac + so + 8)
-            sw3 = _lds_v(ac + so + 12)
-            d = (w0 & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
-            dmin = ((w0 >> 16) & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
-            if E == 1:
-                accm_k = gl.zeros([BM, BN], gl.int32, mma)
-            for ib in gl.static_range(8):
-                if ib % 2 == 0:
-                    qw8 = _lds_v(a2 + so + (ib // 2) * 32)
-                if AMODE == 0:
-                    a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-                elif AMODE == 1:
-                    if ib == 0:
-                        a8 = af0
-                    elif ib == 1:
-                        a8 = af1
-                    elif ib == 2:
-                        a8 = af2
-                    elif ib == 3:
-                        a8 = af3
-                    elif ib == 4:
-                        a8 = af4
-                    elif ib == 5:
-                        a8 = af5
-                    elif ib == 6:
-                        a8 = af6
+                    acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :])
+            elif TP == 23:
+                # IQ4_XS: d | scales_h (word 0), scales_l (word 1), qs words 2-33
+                w0 = _lds_v(ac + so)
+                slw = _lds_v(ac + so + 4)
+                d = (w0 & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                shw = (w0 >> 16) & 0xFFFF
+                nsh2 = (b2 >> 2) * 4
+                for ib in gl.static_range(8):
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if ib == 0:
+                            a8 = af0
+                        elif ib == 1:
+                            a8 = af1
+                        elif ib == 2:
+                            a8 = af2
+                        elif ib == 3:
+                            a8 = af3
+                        elif ib == 4:
+                            a8 = af4
+                        elif ib == 5:
+                            a8 = af5
+                        elif ib == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
                     else:
-                        a8 = af7
-                else:
-                    a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
-                if ib < 4:
-                    sc = (sw1 >> (8 * ib)) & 63
-                    mn = (sw2 >> (8 * ib)) & 63
-                else:
-                    sc = ((sw3 >> (8 * (ib - 4))) & 0xF) | (((sw1 >> (8 * (ib - 4) + 6)) & 3) << 4)
-                    mn = ((sw3 >> (8 * (ib - 4) + 4)) & 0xF) | (((sw2 >> (8 * (ib - 4) + 6)) & 3) << 4)
-                wq = (qw8 >> (4 * (ib % 2))) & 0x0F0F0F0F
-                w4 = _word_to_i8x4(gl.join(gl.join(wq, wq), gl.join(wq, wq)))
-                b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (1, 2, 3, 0)), [32, 64]), db8)
-                acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
+                        a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
+                    q0 = _lds_v(aw + so + (2 + 4 * ib) * 4)
+                    q1 = _lds_v(aw + so + (3 + 4 * ib) * 4)
+                    q2 = _lds_v(aw + so + (4 + 4 * ib) * 4)
+                    q3 = _lds_v(aw + so + (5 + 4 * ib) * 4)
+                    q0_2 = zero2 + q0[:, None]
+                    q1_2 = zero2 + q1[:, None]
+                    q2_2 = zero2 + q2[:, None]
+                    q3_2 = zero2 + q3[:, None]
+                    bl = b2 & 3
+                    qw = gl.where(bl == 0, q0_2, gl.where(bl == 1, q1_2, gl.where(bl == 2, q2_2, q3_2)))
+                    nib4 = (qw >> nsh2) & 0x0F0F0F0F
+                    wq = _kvalues_lookup(nib4, K0, K1, K2, K3)
+                    w4 = _word_to_i8x4(gl.join(gl.join(wq, wq), gl.join(wq, wq)))
+                    b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (1, 2, 3, 0)), [32, 64]), db8)
+                    acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
+                    ls = ((slw >> (4 * ib)) & 0xF) | (((shw >> (2 * ib)) & 3) << 4)
+                    if E == 1:
+                        si = ls - 32
+                        acc_k = acc_k + acc_i * si[None, :]
+                    else:
+                        sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        dl = d * (ls.to(gl.float32) - 32.0)
+                        acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :])
                 if E == 1:
-                    sumx = gl.load(sumrow + kb * 8 + ib, mask=ms_ok, other=0)     # int32 sum of the 32 quantised activations
-                    acc_k = acc_k + acc_i * sc[None, :]
-                    accm_k = accm_k + sumx[:, None] * mn[None, :]
-                else:
-                    sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
-                    sumx = gl.load(sumrow + kb * 8 + ib, mask=ms_ok, other=0.0)
-                    dl = d * sc.to(gl.float32)
-                    ml = dmin * mn.to(gl.float32)
-                    acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :]) - sumx[:, None] * ml[None, :]
-            if E == 1:
-                acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :]) - accm_k.to(gl.float32) * (sx[:, None] * dmin[None, :])
-        elif TP == 18:
-            # IQ3_XXS: qs words 0-15, aux 16-23, d word 24
-            gsh2 = 7 * (b2 >> 1)
-            nsh2x = 4 * (b2 & 1)
-            dw = _lds_v(ac + so + 24 * 4)
-            d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
-            for ib in gl.static_range(8):
-                if AMODE == 0:
-                    a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-                elif AMODE == 1:
-                    if ib == 0:
-                        a8 = af0
-                    elif ib == 1:
-                        a8 = af1
-                    elif ib == 2:
-                        a8 = af2
-                    elif ib == 3:
-                        a8 = af3
-                    elif ib == 4:
-                        a8 = af4
-                    elif ib == 5:
-                        a8 = af5
-                    elif ib == 6:
-                        a8 = af6
-                    else:
-                        a8 = af7
-                else:
-                    a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
-                qsw0 = _lds_v(aw + so + (2 * ib) * 4)
-                qsw1 = _lds_v(aw + so + (2 * ib + 1) * 4)
-                auxw = _lds_v(aw + so + (16 + ib) * 4)
-                auxc = _lds_v(ac + so + (16 + ib) * 4)
-                qsw0_2 = zero2 + qsw0[:, None]
-                qsw1_2 = zero2 + qsw1[:, None]
-                aux_2 = zero2 + auxw[:, None]
-                idx = gl.where(b2 < 4, qsw0_2 >> (8 * b2), qsw1_2 >> (8 * (b2 - 4))) & 0xFF
-                if GX == 1:
-                    gw = _lds(tbx + idx * 4)
-                else:
-                    gw = gl.load(GRID_X + idx)
-                s7 = (aux_2 >> gsh2) & 127
-                mask8 = s7 | ((_popc(s7) & 1) << 7)
-                nib = (mask8 >> nsh2x) & 0xF
-                mask4 = ((nib * 0x204081) & 0x01010101) * 0xFF
-                wq = (gw ^ mask4) + (mask4 & 0x01010101)
-                w4 = _word_to_i8x4(gl.join(gl.join(wq, wq), gl.join(wq, wq)))
-                b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (1, 2, 3, 0)), [32, 64]), db8)
-                acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
-                s = (auxc >> 28) & 0xF
+                    acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :])
+            elif TP == 12:
+                # Q4_K: d | dmin (word 0), scale / min bytes (words 1-3), qs words 4-35
+                w0 = _lds_v(ac + so)
+                sw1 = _lds_v(ac + so + 4)
+                sw2 = _lds_v(ac + so + 8)
+                sw3 = _lds_v(ac + so + 12)
+                d = (w0 & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                dmin = ((w0 >> 16) & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
                 if E == 1:
-                    si = 2 * s + 1
-                    acc_k = acc_k + acc_i * si[None, :]
-                else:
-                    sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
-                    dl = d * (2.0 * s.to(gl.float32) + 1.0) * 0.25
-                    acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :])
-            if E == 1:
-                acc = acc + acc_k.to(gl.float32) * (sx[:, None] * (d * 0.25)[None, :])
-        elif TP == 16:
-            # IQ2_XXS: qs / aux word pairs 0-15, d at word 16
-            g2 = b2 >> 1
-            w2 = b2 & 1
-            nsh2i = 4 * w2
-            dw = _lds_v(ac + so + 16 * 4)
-            d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
-            for ib in gl.static_range(8):
-                if AMODE == 0:
-                    a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-                elif AMODE == 1:
-                    if ib == 0:
-                        a8 = af0
-                    elif ib == 1:
-                        a8 = af1
-                    elif ib == 2:
-                        a8 = af2
-                    elif ib == 3:
-                        a8 = af3
-                    elif ib == 4:
-                        a8 = af4
-                    elif ib == 5:
-                        a8 = af5
-                    elif ib == 6:
-                        a8 = af6
+                    accm_k = gl.zeros([BM, BN], gl.int32, mma)
+                for ib in gl.static_range(8):
+                    if ib % 2 == 0:
+                        qw8 = _lds_v(a2 + so + (ib // 2) * 32)
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if ib == 0:
+                            a8 = af0
+                        elif ib == 1:
+                            a8 = af1
+                        elif ib == 2:
+                            a8 = af2
+                        elif ib == 3:
+                            a8 = af3
+                        elif ib == 4:
+                            a8 = af4
+                        elif ib == 5:
+                            a8 = af5
+                        elif ib == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
                     else:
-                        a8 = af7
-                else:
-                    a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
-                f0 = _lds_v(aw + so + (2 * ib) * 4)
-                aux = _lds_v(aw + so + (2 * ib + 1) * 4)
-                auxc = _lds_v(ac + so + (2 * ib + 1) * 4)
-                f0_2 = zero2 + f0[:, None]
-                aux_2 = zero2 + aux[:, None]
-                idx = (f0_2 >> (8 * g2)) & 0xFF
-                s7 = (aux_2 >> (7 * g2)) & 127
-                mask8 = s7 | ((_popc(s7) & 1) << 7)
-                gw = gl.load(GRID2_XXS + idx * 2 + w2)
-                wq = _negate_bytes(gw, (mask8 >> nsh2i) & 0xF)
-                acc_i = mma_v2(a8, _b_operand(wq, db8), gl.zeros([BM, BN], gl.int32, mma))
-                s = (auxc >> 28) & 0xF
+                        a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
+                    if ib < 4:
+                        sc = (sw1 >> (8 * ib)) & 63
+                        mn = (sw2 >> (8 * ib)) & 63
+                    else:
+                        sc = ((sw3 >> (8 * (ib - 4))) & 0xF) | (((sw1 >> (8 * (ib - 4) + 6)) & 3) << 4)
+                        mn = ((sw3 >> (8 * (ib - 4) + 4)) & 0xF) | (((sw2 >> (8 * (ib - 4) + 6)) & 3) << 4)
+                    wq = (qw8 >> (4 * (ib % 2))) & 0x0F0F0F0F
+                    w4 = _word_to_i8x4(gl.join(gl.join(wq, wq), gl.join(wq, wq)))
+                    b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (1, 2, 3, 0)), [32, 64]), db8)
+                    acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
+                    if E == 1:
+                        sumx = gl.load(sumrow + kb * 8 + ib, mask=ms_ok, other=0)     # int32 sum of the 32 quantised activations
+                        acc_k = acc_k + acc_i * sc[None, :]
+                        accm_k = accm_k + sumx[:, None] * mn[None, :]
+                    else:
+                        sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        sumx = gl.load(sumrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        dl = d * sc.to(gl.float32)
+                        ml = dmin * mn.to(gl.float32)
+                        acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :]) - sumx[:, None] * ml[None, :]
                 if E == 1:
-                    si = 2 * s + 1
-                    acc_k = acc_k + acc_i * si[None, :]
-                else:
-                    sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
-                    dl = d * (2.0 * s.to(gl.float32) + 1.0) * 0.125
-                    acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :])
-            if E == 1:
-                acc = acc + acc_k.to(gl.float32) * (sx[:, None] * (d * 0.125)[None, :])
-        else:
-            # IQ2_XS (17): qs words 0-15, scales 16-17, d 18; IQ2_S (22): qs 0-7, signs 8-15, qh 16-17, scales 18-19, d 20
-            g2 = b2 >> 1
-            w2 = b2 & 1
-            nsh2i = 4 * w2
-            if TP == 17:
-                dw = _lds_v(ac + so + 18 * 4)
-            else:
-                dw = _lds_v(ac + so + 20 * 4)
-            d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
-            for ib in gl.static_range(8):
-                if AMODE == 0:
-                    a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
-                elif AMODE == 1:
-                    if ib == 0:
-                        a8 = af0
-                    elif ib == 1:
-                        a8 = af1
-                    elif ib == 2:
-                        a8 = af2
-                    elif ib == 3:
-                        a8 = af3
-                    elif ib == 4:
-                        a8 = af4
-                    elif ib == 5:
-                        a8 = af5
-                    elif ib == 6:
-                        a8 = af6
+                    acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :]) - accm_k.to(gl.float32) * (sx[:, None] * dmin[None, :])
+            elif TP == 18:
+                # IQ3_XXS: qs words 0-15, aux 16-23, d word 24
+                gsh2 = 7 * (b2 >> 1)
+                nsh2x = 4 * (b2 & 1)
+                dw = _lds_v(ac + so + 24 * 4)
+                d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                for ib in gl.static_range(8):
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if ib == 0:
+                            a8 = af0
+                        elif ib == 1:
+                            a8 = af1
+                        elif ib == 2:
+                            a8 = af2
+                        elif ib == 3:
+                            a8 = af3
+                        elif ib == 4:
+                            a8 = af4
+                        elif ib == 5:
+                            a8 = af5
+                        elif ib == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
                     else:
-                        a8 = af7
-                else:
-                    a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
-                if TP == 17:
-                    f0 = _lds_v(aw + so + (2 * ib) * 4)
-                    f1 = _lds_v(aw + so + (2 * ib + 1) * 4)
-                    scb = (_lds_v(ac + so + (16 + ib // 4) * 4) >> (8 * (ib % 4))) & 0xFF
-                    f0_2 = zero2 + f0[:, None]
-                    f1_2 = zero2 + f1[:, None]
-                    q2 = gl.where(g2 < 2, f0_2 >> (16 * (g2 & 1)), f1_2 >> (16 * (g2 & 1))) & 0xFFFF
-                    idx = q2 & 511
-                    s7 = q2 >> 9
+                        a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
+                    qsw0 = _lds_v(aw + so + (2 * ib) * 4)
+                    qsw1 = _lds_v(aw + so + (2 * ib + 1) * 4)
+                    auxw = _lds_v(aw + so + (16 + ib) * 4)
+                    auxc = _lds_v(ac + so + (16 + ib) * 4)
+                    qsw0_2 = zero2 + qsw0[:, None]
+                    qsw1_2 = zero2 + qsw1[:, None]
+                    aux_2 = zero2 + auxw[:, None]
+                    idx = gl.where(b2 < 4, qsw0_2 >> (8 * b2), qsw1_2 >> (8 * (b2 - 4))) & 0xFF
+                    if GX == 1:
+                        gw = _lds(tbx + idx * 4)
+                    else:
+                        gw = gl.load(GRID_X + idx)
+                    s7 = (aux_2 >> gsh2) & 127
                     mask8 = s7 | ((_popc(s7) & 1) << 7)
-                    gw = gl.load(GRID2_XS + idx * 2 + w2)
-                else:
-                    f0 = _lds_v(aw + so + ib * 4)
-                    sg = _lds_v(aw + so + (8 + ib) * 4)
-                    qhb = (_lds_v(aw + so + (16 + ib // 4) * 4) >> (8 * (ib % 4))) & 0xFF
-                    scb = (_lds_v(ac + so + (18 + ib // 4) * 4) >> (8 * (ib % 4))) & 0xFF
-                    f0_2 = zero2 + f0[:, None]
-                    sg_2 = zero2 + sg[:, None]
-                    qh_2 = zero2 + qhb[:, None]
-                    idx = ((f0_2 >> (8 * g2)) & 0xFF) | (((qh_2 >> (2 * g2)) & 3) << 8)
-                    mask8 = (sg_2 >> (8 * g2)) & 0xFF
-                    gw = gl.load(GRID2_S + idx * 2 + w2)
-                wq = _negate_bytes(gw, (mask8 >> nsh2i) & 0xF)
-                wq_lo = gl.where(b2 < 4, wq, 0)
-                wq_hi = gl.where(b2 >= 4, wq, 0)
-                acc_lo = mma_v2(a8, _b_operand(wq_lo, db8), gl.zeros([BM, BN], gl.int32, mma))
-                acc_hi = mma_v2(a8, _b_operand(wq_hi, db8), gl.zeros([BM, BN], gl.int32, mma))
-                s_lo = scb & 0xF
-                s_hi = (scb >> 4) & 0xF
+                    nib = (mask8 >> nsh2x) & 0xF
+                    mask4 = ((nib * 0x204081) & 0x01010101) * 0xFF
+                    wq = (gw ^ mask4) + (mask4 & 0x01010101)
+                    w4 = _word_to_i8x4(gl.join(gl.join(wq, wq), gl.join(wq, wq)))
+                    b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (1, 2, 3, 0)), [32, 64]), db8)
+                    acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
+                    s = (auxc >> 28) & 0xF
+                    if E == 1:
+                        si = 2 * s + 1
+                        acc_k = acc_k + acc_i * si[None, :]
+                    else:
+                        sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        dl = d * (2.0 * s.to(gl.float32) + 1.0) * 0.25
+                        acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :])
                 if E == 1:
-                    acc_k = acc_k + acc_lo * (2 * s_lo + 1)[None, :] + acc_hi * (2 * s_hi + 1)[None, :]
+                    acc = acc + acc_k.to(gl.float32) * (sx[:, None] * (d * 0.25)[None, :])
+            elif TP == 16:
+                # IQ2_XXS: qs / aux word pairs 0-15, d at word 16
+                g2 = b2 >> 1
+                w2 = b2 & 1
+                nsh2i = 4 * w2
+                dw = _lds_v(ac + so + 16 * 4)
+                d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                for ib in gl.static_range(8):
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if ib == 0:
+                            a8 = af0
+                        elif ib == 1:
+                            a8 = af1
+                        elif ib == 2:
+                            a8 = af2
+                        elif ib == 3:
+                            a8 = af3
+                        elif ib == 4:
+                            a8 = af4
+                        elif ib == 5:
+                            a8 = af5
+                        elif ib == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
+                    else:
+                        a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
+                    f0 = _lds_v(aw + so + (2 * ib) * 4)
+                    aux = _lds_v(aw + so + (2 * ib + 1) * 4)
+                    auxc = _lds_v(ac + so + (2 * ib + 1) * 4)
+                    f0_2 = zero2 + f0[:, None]
+                    aux_2 = zero2 + aux[:, None]
+                    idx = (f0_2 >> (8 * g2)) & 0xFF
+                    s7 = (aux_2 >> (7 * g2)) & 127
+                    mask8 = s7 | ((_popc(s7) & 1) << 7)
+                    gw = gl.load(GRID2_XXS + idx * 2 + w2)
+                    wq = _negate_bytes(gw, (mask8 >> nsh2i) & 0xF)
+                    acc_i = mma_v2(a8, _b_operand(wq, db8), gl.zeros([BM, BN], gl.int32, mma))
+                    s = (auxc >> 28) & 0xF
+                    if E == 1:
+                        si = 2 * s + 1
+                        acc_k = acc_k + acc_i * si[None, :]
+                    else:
+                        sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        dl = d * (2.0 * s.to(gl.float32) + 1.0) * 0.125
+                        acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dl[None, :])
+                if E == 1:
+                    acc = acc + acc_k.to(gl.float32) * (sx[:, None] * (d * 0.125)[None, :])
+            elif TP == 8:
+                # Q8_0 (NST 2): the stage holds four 32-weight blocks - block i's qs in words 8 i..8 i + 7 (the B fragment as it
+                # is), the four d in words 32-33; no decode, the scale per 32 applied in fp32 per sub-block in both forms
+                dw0 = _lds_v(ac + so + 32 * 4)
+                dw1 = _lds_v(ac + so + 33 * 4)
+                for i in gl.static_range(4):
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + (4 * h + i) * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if (4 * h + i) == 0:
+                            a8 = af0
+                        elif (4 * h + i) == 1:
+                            a8 = af1
+                        elif (4 * h + i) == 2:
+                            a8 = af2
+                        elif (4 * h + i) == 3:
+                            a8 = af3
+                        elif (4 * h + i) == 4:
+                            a8 = af4
+                        elif (4 * h + i) == 5:
+                            a8 = af5
+                        elif (4 * h + i) == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
+                    else:
+                        a8 = a_tile.slice((4 * h + i) * 32, 32, dim=1).load(da8)
+                    qw8 = _lds_v(a2z + so + i * 32)
+                    w4 = _word_to_i8x4(gl.join(gl.join(qw8, qw8), gl.join(qw8, qw8)))
+                    b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (1, 2, 3, 0)), [32, 64]), db8)
+                    acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
+                    if i < 2:
+                        dh = ((dw0 >> (16 * i)) & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                    else:
+                        dh = ((dw1 >> (16 * (i - 2))) & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                    if E == 1:
+                        acc = acc + acc_i.to(gl.float32) * (sx[:, None] * dh[None, :])
+                    else:
+                        sx32 = gl.load(sxrow + kb * 8 + (4 * h + i), mask=ms_ok, other=0.0)
+                        acc = acc + acc_i.to(gl.float32) * (sx32[:, None] * dh[None, :])
+            elif TP == 11:
+                # Q3_K: hmask words 0-7, qs words 8-23, the 16 six-bit scales in words 24-26, d in word 27. Weight 32 ib + p:
+                # bits 2 (ib % 4) of qs byte 32 (ib // 4) + p, minus 4 where bit 4 (ib // 4) + ib % 4 of hmask byte p is clear;
+                # a scale per 16 (sc - 32, signed), so the two halves of a sub-block on their own mma as in IQ2_XS
+                dw = _lds_v(ac + so + 27 * 4)
+                d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                s0 = _lds_v(ac + so + 24 * 4)
+                s1 = _lds_v(ac + so + 25 * 4)
+                s2 = _lds_v(ac + so + 26 * 4)
+                nh8 = ~_lds_v(a2z + so)                                                # hmask inverted: a set bit where 4 is subtracted
+                for ib in gl.static_range(8):
+                    if ib % 4 == 0:
+                        qs8 = _lds_v(a2z + so + 32 + (ib // 4) * 32)
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if ib == 0:
+                            a8 = af0
+                        elif ib == 1:
+                            a8 = af1
+                        elif ib == 2:
+                            a8 = af2
+                        elif ib == 3:
+                            a8 = af3
+                        elif ib == 4:
+                            a8 = af4
+                        elif ib == 5:
+                            a8 = af5
+                        elif ib == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
+                    else:
+                        a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
+                    q2 = (qs8 >> (2 * (ib % 4))) & 0x03030303
+                    m4 = ((nh8 >> (4 * (ib // 4) + ib % 4)) & 0x01010101) * 0xFC
+                    wq = q2 | m4                                                            # q - 4 as int8 where the hmask bit is clear
+                    wq_lo = gl.where(b2 < 4, wq, 0)
+                    wq_hi = gl.where(b2 >= 4, wq, 0)
+                    acc_lo = mma_v2(a8, _b_operand(wq_lo, db8), gl.zeros([BM, BN], gl.int32, mma))
+                    acc_hi = mma_v2(a8, _b_operand(wq_hi, db8), gl.zeros([BM, BN], gl.int32, mma))
+                    # scales 2 ib and 2 ib + 1: the low nibble from byte (2 ib) % 8 (its high half for scales 8-15), the high two
+                    # bits from byte 8 + (2 ib) % 4 at 2 (ib // 2)
+                    if ib % 4 < 2:
+                        sl_lo = (s0 >> (16 * (ib % 4) + 4 * (ib // 4))) & 0xF
+                        sl_hi = (s0 >> (16 * (ib % 4) + 8 + 4 * (ib // 4))) & 0xF
+                    else:
+                        sl_lo = (s1 >> (16 * (ib % 4 - 2) + 4 * (ib // 4))) & 0xF
+                        sl_hi = (s1 >> (16 * (ib % 4 - 2) + 8 + 4 * (ib // 4))) & 0xF
+                    sh_lo = (s2 >> (8 * ((2 * ib) % 4) + 2 * (ib // 2))) & 3
+                    sh_hi = (s2 >> (8 * ((2 * ib + 1) % 4) + 2 * (ib // 2))) & 3
+                    sc_lo = (sl_lo | (sh_lo << 4)) - 32
+                    sc_hi = (sl_hi | (sh_hi << 4)) - 32
+                    if E == 1:
+                        acc_k = acc_k + acc_lo * sc_lo[None, :] + acc_hi * sc_hi[None, :]
+                    else:
+                        sx32 = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        dl_lo = d * sc_lo.to(gl.float32)
+                        dl_hi = d * sc_hi.to(gl.float32)
+                        acc = acc + acc_lo.to(gl.float32) * (sx32[:, None] * dl_lo[None, :]) + acc_hi.to(gl.float32) * (sx32[:, None] * dl_hi[None, :])
+                if E == 1:
+                    acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :])
+            elif TP == 13:
+                # Q5_K: Q4_K's header (d | dmin in word 0, the scale / min bytes in words 1-3), qh words 4-11, qs words 12-43;
+                # weight 32 ib + p adds bit ib of qh byte p as its bit 4 (unsigned 0..31), the min term as Q4_K's
+                w0 = _lds_v(ac + so)
+                sw1 = _lds_v(ac + so + 4)
+                sw2 = _lds_v(ac + so + 8)
+                sw3 = _lds_v(ac + so + 12)
+                d = (w0 & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                dmin = ((w0 >> 16) & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                qh8 = _lds_v(a2z + so + 16)                                            # qh word b: bytes p = 4 b..4 b + 3, bit ib
+                if E == 1:
+                    accm_k = gl.zeros([BM, BN], gl.int32, mma)
+                for ib in gl.static_range(8):
+                    if ib % 2 == 0:
+                        qw8 = _lds_v(a2z + so + 48 + (ib // 2) * 32)
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if ib == 0:
+                            a8 = af0
+                        elif ib == 1:
+                            a8 = af1
+                        elif ib == 2:
+                            a8 = af2
+                        elif ib == 3:
+                            a8 = af3
+                        elif ib == 4:
+                            a8 = af4
+                        elif ib == 5:
+                            a8 = af5
+                        elif ib == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
+                    else:
+                        a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
+                    if ib < 4:
+                        sc = (sw1 >> (8 * ib)) & 63
+                        mn = (sw2 >> (8 * ib)) & 63
+                    else:
+                        sc = ((sw3 >> (8 * (ib - 4))) & 0xF) | (((sw1 >> (8 * (ib - 4) + 6)) & 3) << 4)
+                        mn = ((sw3 >> (8 * (ib - 4) + 4)) & 0xF) | (((sw2 >> (8 * (ib - 4) + 6)) & 3) << 4)
+                    wq = ((qw8 >> (4 * (ib % 2))) & 0x0F0F0F0F) | (((qh8 >> ib) & 0x01010101) << 4)   # four unsigned 5-bit weights
+                    w4 = _word_to_i8x4(gl.join(gl.join(wq, wq), gl.join(wq, wq)))
+                    b8 = gl.convert_layout(gl.reshape(gl.permute(w4, (1, 2, 3, 0)), [32, 64]), db8)
+                    acc_i = mma_v2(a8, b8, gl.zeros([BM, BN], gl.int32, mma))
+                    if E == 1:
+                        sumx = gl.load(sumrow + kb * 8 + ib, mask=ms_ok, other=0)     # int32 sum of the 32 quantised activations
+                        acc_k = acc_k + acc_i * sc[None, :]
+                        accm_k = accm_k + sumx[:, None] * mn[None, :]
+                    else:
+                        sx32 = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        sumx = gl.load(sumrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        dl = d * sc.to(gl.float32)
+                        ml = dmin * mn.to(gl.float32)
+                        acc = acc + acc_i.to(gl.float32) * (sx32[:, None] * dl[None, :]) - sumx[:, None] * ml[None, :]
+                if E == 1:
+                    acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :]) - accm_k.to(gl.float32) * (sx[:, None] * dmin[None, :])
+            elif TP == 14:
+                # Q6_K (NST 2): the stage holds one half of the block (128 weights): ql words 0-15, qh words 16-23, the eight
+                # int8 scales in words 24-25, d in word 26. Weight 32 t + p of the half: the nibble t // 2 of ql byte 32 (t % 2) + p
+                # with bits 2 t of qh byte p above it, minus 32 (signed -32..31); a scale per 16, two mmas per sub-block
+                dw = _lds_v(ac + so + 26 * 4)
+                d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                sw0 = _lds_v(ac + so + 24 * 4)
+                sw1 = _lds_v(ac + so + 25 * 4)
+                qla = _lds_v(a2z + so)                                                 # ql words 0-7: weights 0-31 low, 64-95 high
+                qlb = _lds_v(a2z + so + 32)                                            # ql words 8-15: weights 32-63 low, 96-127 high
+                qh8 = _lds_v(a2z + so + 64)
+                for t in gl.static_range(4):
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + (4 * h + t) * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if (4 * h + t) == 0:
+                            a8 = af0
+                        elif (4 * h + t) == 1:
+                            a8 = af1
+                        elif (4 * h + t) == 2:
+                            a8 = af2
+                        elif (4 * h + t) == 3:
+                            a8 = af3
+                        elif (4 * h + t) == 4:
+                            a8 = af4
+                        elif (4 * h + t) == 5:
+                            a8 = af5
+                        elif (4 * h + t) == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
+                    else:
+                        a8 = a_tile.slice((4 * h + t) * 32, 32, dim=1).load(da8)
+                    if t % 2 == 0:
+                        qlw = qla
+                    else:
+                        qlw = qlb
+                    q6 = ((qlw >> (4 * (t // 2))) & 0x0F0F0F0F) | (((qh8 >> (2 * t)) & 0x03030303) << 4)   # four 6-bit weights 0..63
+                    wq = (q6 ^ 0x20202020) | (((~q6 >> 5) & 0x01010101) * 0xC0)                          # q - 32 as int8
+                    wq_lo = gl.where(b2 < 4, wq, 0)
+                    wq_hi = gl.where(b2 >= 4, wq, 0)
+                    acc_lo = mma_v2(a8, _b_operand(wq_lo, db8), gl.zeros([BM, BN], gl.int32, mma))
+                    acc_hi = mma_v2(a8, _b_operand(wq_hi, db8), gl.zeros([BM, BN], gl.int32, mma))
+                    if t < 2:
+                        sw = sw0
+                    else:
+                        sw = sw1
+                    sc_lo = (((sw >> (16 * (t % 2))) & 0xFF) ^ 0x80) - 0x80                                 # scales 2 t, 2 t + 1 of the half, signed
+                    sc_hi = (((sw >> (16 * (t % 2) + 8)) & 0xFF) ^ 0x80) - 0x80
+                    if E == 1:
+                        acc_k = acc_k + acc_lo * sc_lo[None, :] + acc_hi * sc_hi[None, :]
+                    else:
+                        sx32 = gl.load(sxrow + kb * 8 + (4 * h + t), mask=ms_ok, other=0.0)
+                        dl_lo = d * sc_lo.to(gl.float32)
+                        dl_hi = d * sc_hi.to(gl.float32)
+                        acc = acc + acc_lo.to(gl.float32) * (sx32[:, None] * dl_lo[None, :]) + acc_hi.to(gl.float32) * (sx32[:, None] * dl_hi[None, :])
+                if E == 1:
+                    if h == 1:
+                        acc = acc + acc_k.to(gl.float32) * (sx[:, None] * d[None, :])
+            else:
+                # IQ2_XS (17): qs words 0-15, scales 16-17, d 18; IQ2_S (22): qs 0-7, signs 8-15, qh 16-17, scales 18-19, d 20
+                g2 = b2 >> 1
+                w2 = b2 & 1
+                nsh2i = 4 * w2
+                if TP == 17:
+                    dw = _lds_v(ac + so + 18 * 4)
                 else:
-                    sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
-                    dl_lo = d * (2.0 * s_lo.to(gl.float32) + 1.0) * 0.125
-                    dl_hi = d * (2.0 * s_hi.to(gl.float32) + 1.0) * 0.125
-                    acc = acc + acc_lo.to(gl.float32) * (sx[:, None] * dl_lo[None, :]) + acc_hi.to(gl.float32) * (sx[:, None] * dl_hi[None, :])
-            if E == 1:
-                acc = acc + acc_k.to(gl.float32) * (sx[:, None] * (d * 0.125)[None, :])
-        gl.barrier()
+                    dw = _lds_v(ac + so + 20 * 4)
+                d = (dw & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True).to(gl.float32)
+                for ib in gl.static_range(8):
+                    if AMODE == 0:
+                        a8 = gl.load(xrow + (kb * 256 + ib * 32 + kx)[None, :], mask=m_ok[:, None], other=0)
+                    elif AMODE == 1:
+                        if ib == 0:
+                            a8 = af0
+                        elif ib == 1:
+                            a8 = af1
+                        elif ib == 2:
+                            a8 = af2
+                        elif ib == 3:
+                            a8 = af3
+                        elif ib == 4:
+                            a8 = af4
+                        elif ib == 5:
+                            a8 = af5
+                        elif ib == 6:
+                            a8 = af6
+                        else:
+                            a8 = af7
+                    else:
+                        a8 = a_tile.slice(ib * 32, 32, dim=1).load(da8)
+                    if TP == 17:
+                        f0 = _lds_v(aw + so + (2 * ib) * 4)
+                        f1 = _lds_v(aw + so + (2 * ib + 1) * 4)
+                        scb = (_lds_v(ac + so + (16 + ib // 4) * 4) >> (8 * (ib % 4))) & 0xFF
+                        f0_2 = zero2 + f0[:, None]
+                        f1_2 = zero2 + f1[:, None]
+                        q2 = gl.where(g2 < 2, f0_2 >> (16 * (g2 & 1)), f1_2 >> (16 * (g2 & 1))) & 0xFFFF
+                        idx = q2 & 511
+                        s7 = q2 >> 9
+                        mask8 = s7 | ((_popc(s7) & 1) << 7)
+                        gw = gl.load(GRID2_XS + idx * 2 + w2)
+                    else:
+                        f0 = _lds_v(aw + so + ib * 4)
+                        sg = _lds_v(aw + so + (8 + ib) * 4)
+                        qhb = (_lds_v(aw + so + (16 + ib // 4) * 4) >> (8 * (ib % 4))) & 0xFF
+                        scb = (_lds_v(ac + so + (18 + ib // 4) * 4) >> (8 * (ib % 4))) & 0xFF
+                        f0_2 = zero2 + f0[:, None]
+                        sg_2 = zero2 + sg[:, None]
+                        qh_2 = zero2 + qhb[:, None]
+                        idx = ((f0_2 >> (8 * g2)) & 0xFF) | (((qh_2 >> (2 * g2)) & 3) << 8)
+                        mask8 = (sg_2 >> (8 * g2)) & 0xFF
+                        gw = gl.load(GRID2_S + idx * 2 + w2)
+                    wq = _negate_bytes(gw, (mask8 >> nsh2i) & 0xF)
+                    wq_lo = gl.where(b2 < 4, wq, 0)
+                    wq_hi = gl.where(b2 >= 4, wq, 0)
+                    acc_lo = mma_v2(a8, _b_operand(wq_lo, db8), gl.zeros([BM, BN], gl.int32, mma))
+                    acc_hi = mma_v2(a8, _b_operand(wq_hi, db8), gl.zeros([BM, BN], gl.int32, mma))
+                    s_lo = scb & 0xF
+                    s_hi = (scb >> 4) & 0xF
+                    if E == 1:
+                        acc_k = acc_k + acc_lo * (2 * s_lo + 1)[None, :] + acc_hi * (2 * s_hi + 1)[None, :]
+                    else:
+                        sx = gl.load(sxrow + kb * 8 + ib, mask=ms_ok, other=0.0)
+                        dl_lo = d * (2.0 * s_lo.to(gl.float32) + 1.0) * 0.125
+                        dl_hi = d * (2.0 * s_hi.to(gl.float32) + 1.0) * 0.125
+                        acc = acc + acc_lo.to(gl.float32) * (sx[:, None] * dl_lo[None, :]) + acc_hi.to(gl.float32) * (sx[:, None] * dl_hi[None, :])
+                if E == 1:
+                    acc = acc + acc_k.to(gl.float32) * (sx[:, None] * (d * 0.125)[None, :])
+            gl.barrier()
     ym = gl.arange(0, BM, layout=SliceLayout(1, mma))
     yn = gl.arange(0, BN, layout=SliceLayout(0, mma))
     omask = (ym[:, None] < M) & (yn[None, :] < n_valid)
     keep = smem.slice(0, 64).load(SliceLayout(0, mma))
     omask = omask & (keep[None, :] != 0x7FFFFFFF)
     if REGION == 0:   # 0046: only region 0's second allocation is otherwise untouched (regions 3 and 4 hold the A stages)
+        keep2 = smem2.slice(0, 64).load(SliceLayout(0, mma))
+        omask = omask & (keep2[None, :] != 0x7FFFFFFF)
+    if REGION == 5:   # the wide stages reach into the second allocation through raw addresses only
         keep2 = smem2.slice(0, 64).load(SliceLayout(0, mma))
         omask = omask & (keep2[None, :] != 0x7FFFFFFF)
     Yp = Y + split.to(gl.int64) * stride_yk
@@ -802,7 +1054,7 @@ def _run(TP: gl.constexpr, RW: gl.constexpr, E: gl.constexpr, smem, smem2, TILES
 @g.jit
 def tiles_grouped_kernel(XQ, SX, SUMX, TILES, DESC, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
                          M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk,
-                         BM: gl.constexpr, BN: gl.constexpr, STAGE_: gl.constexpr, TAB: gl.constexpr, E: gl.constexpr,
+                         BM: gl.constexpr, BN: gl.constexpr, STAGE_: gl.constexpr, TAB: gl.constexpr, E: gl.constexpr, NEW: gl.constexpr,
                          K0: gl.constexpr, K1: gl.constexpr, K2: gl.constexpr, K3: gl.constexpr,
                          AMODE: gl.constexpr, STAGES: gl.constexpr, GX: gl.constexpr, REGION: gl.constexpr, TABX: gl.constexpr, AOFF: gl.constexpr):
     smem_flat: gl.constexpr = SwizzledSharedLayout(4, 1, 1, [0])
@@ -833,32 +1085,63 @@ def tiles_grouped_kernel(XQ, SX, SUMX, TILES, DESC, Y, GRID_S, GRID_X, GRID2_XXS
         # 0046 compact: stages at 0 / 1792 and the tables at 3584, the 32-row A stages in the second allocation
         smem = gl.allocate_shared_memory(gl.int32, [4096], smem_flat)
         smem2 = gl.allocate_shared_memory(gl.int32, [4096], smem_flat)
+    elif REGION == 5:
+        # the wide stages (2,816 words) at 0 / 2816 across [4096] + [2048] (24 KB, four blocks), the tables in stage 0's tail
+        smem = gl.allocate_shared_memory(gl.int32, [4096], smem_flat)
+        smem2 = gl.allocate_shared_memory(gl.int32, [2048], smem_flat)
+    elif REGION == 6:
+        # the wide stages at 0 / 2816, the A stages at 6144, one [8192] region
+        smem = gl.allocate_shared_memory(gl.int32, [8192], smem_flat)
+        smem2 = smem
+    elif REGION == 7:
+        # the wide stages at 0 / 2816, the 32-row A stages in the second allocation
+        smem = gl.allocate_shared_memory(gl.int32, [8192], smem_flat)
+        smem2 = gl.allocate_shared_memory(gl.int32, [4096], smem_flat)
     else:
         smem = gl.allocate_shared_memory(gl.int32, [4096], smem_flat)
         smem2 = gl.allocate_shared_memory(gl.int32, [512], smem_flat)
     TILES32 = TILES.to(gl.pointer_type(gl.int32), bitcast=True)
     # the type is uniform per CTA: one branch, one compiled decode with its row words
     if tp == 21:
-        _run(21, 28, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+        _run(21, 28, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
              M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
     elif tp == 23:
-        _run(23, 34, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+        _run(23, 34, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
              M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
     elif tp == 12:
-        _run(12, 36, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+        _run(12, 36, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
              M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
     elif tp == 18:
-        _run(18, 25, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+        _run(18, 25, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
              M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
     elif tp == 16:
-        _run(16, 17, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+        _run(16, 17, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
              M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
     elif tp == 17:
-        _run(17, 19, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+        _run(17, 19, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
              M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
-    else:
-        _run(22, 21, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+    elif tp == 22:
+        _run(22, 21, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
              M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+    # the K-quant / Q8_0 types (kq_tiles.py): members of the same chain, each compiled only when the launch's NEW mask names its
+    # type (a layer without them compiles to the seven-type kernel; as separate ifs after the chain they cost the M = 1
+    # variant 29 registers, 126 -> 155)
+    elif tp == 8:
+        if NEW & 1:
+            _run(8, 68, 2, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+    elif tp == 11:
+        if NEW & 2:
+            _run(11, 28, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+    elif tp == 13:
+        if NEW & 4:
+            _run(13, 44, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+    elif tp == 14:
+        if NEW & 8:
+            _run(14, 54, 2, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
 
 
 def grouped_gemm(packed: torch.Tensor, meta, X: torch.Tensor, splitk: int | None = None, num_warps: int = 4,
@@ -894,15 +1177,16 @@ def grouped_gemm(packed: torch.Tensor, meta, X: torch.Tensor, splitk: int | None
     else:
         Y = torch.empty((splitk, M, n_total), dtype=torch.float32, device=dev)
         stride_ym, stride_yk = Y.stride(1), Y.stride(0)
+    types = {wt for _, wt, _, _, _, _ in meta['shards']} if 'shards' in meta else set(meta.get('types', ()))
+    new = sum(NEW_BIT[wt] for wt in types if wt in NEW_BIT)     # the K-quant / Q8_0 branches compiled only when the layer has them
     if amode is None:
-        types = {wt for _, wt, _, _, _, _ in meta['shards']} if 'shards' in meta else set(meta.get('types', ()))
         # the M = 1 variant keeps the direct loads at five blocks; M != 1 stages the A tile, except the layers of IQ2
         # types only (pipeline-limited: the shared A reads cost them 4 %, the cell of 19:28)
         amode = 0 if (M == 1 or (types and types <= {16, 17, 22} and bm == 16)) else 2   # 0046: the direct-load A at bm 32 costs 246 registers
     if stages is None:
         stages = 2
     assert amode in (0, 1, 2) and stages in (2, 3) and not (amode == 2 and stages == 3)
-    max_rw = meta.get("max_rw") or max(rw for _, _, rw, _, _, _ in meta["shards"])
+    max_rw = meta.get("max_rw") or max(STAGE_ROW_WORDS[wt] for _, wt, _, _, _, _ in meta["shards"])   # the largest stage row (Q6_K, Q8_0: half a k-block)
     if compact is None:
         compact = False                      # the 24 KB region's fourth block costs the byte-heavy shapes 3-20 % (the cell of 19:35)
     assert not compact or (amode == 2 and max_rw <= 28)
@@ -910,12 +1194,17 @@ def grouped_gemm(packed: torch.Tensor, meta, X: torch.Tensor, splitk: int | None
     if bm == 32 and amode == 2:
         region = 4 if max_rw <= 28 else 3     # 0046: the doubled A stages need the second allocation
     assert not (bm == 32 and amode == 2) or region in (3, 4), (bm, amode, region)
+    assert not (new and stages == 3), "the half-staged types run on the two-stage pipeline"
+    if max_rw > 36:
+        # a Q5_K shard: the 2,816-word stages in the shapes of regions 0 / 1 / 3 (5 / 6 / 7)
+        assert max_rw <= STAGE_WIDE // 64 and region in (0, 1, 3), (max_rw, region)
+        region = {0: 5, 1: 6, 3: 7}[region]
     R = REGIONS[region]
     tiles_grouped_kernel[(desc.shape[0],)](
         XQ, SX, SUMX, packed, desc, Y, grid32_iq3s(dev), grid32_iq3xxs(dev),
         grid_words(GGML_TYPE_IQ2_XXS, dev), grid_words(GGML_TYPE_IQ2_XS, dev), grid_words(GGML_TYPE_IQ2_S, dev),
         M, XQ.stride(0), SX.stride(0), SUMX.stride(0), stride_ym, stride_yk,
-        BM=bm, BN=64, STAGE_=R["stage"], TAB=R["tab"], E=int(e), K0=T0, K1=T1, K2=T2, K3=T3,
+        BM=bm, BN=64, STAGE_=R["stage"], TAB=R["tab"], E=int(e), NEW=new, K0=T0, K1=T1, K2=T2, K3=T3,
         AMODE=amode, STAGES=stages, GX=int(gx), REGION=region, TABX=R["tabx"], AOFF=R["aoff"], num_warps=num_warps,
         **({"maxnreg": maxnreg} if maxnreg else {}))
     if splitk == 1:

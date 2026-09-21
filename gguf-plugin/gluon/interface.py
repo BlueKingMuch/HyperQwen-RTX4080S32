@@ -16,7 +16,7 @@ from .iq3s_int8c import iq3s_int8c_gemm
 from .iq3s_int8t import iq3s_int8t_gemm, repack_iq3s_tiles  # noqa: F401  (0036: the tile-major form; the loader repacks)
 from .iq3s_tile_dequant import dequantize_iq3s_tiles  # 0037: the prefill's dequantiser on the tiles
 from .tiles import TILE_TYPES, dequantize_tiles, repack_tiles, tiles_gemm  # noqa: F401  (0038: every int8 type tile-major; the loader repacks)
-from .tiles_grouped import grouped_gemm, grouped_split_for, prepare_grouped_layer, quantize_activations_256  # noqa: F401  (0042: one kernel for every tile-type layer; the loader packs)
+from .tiles_grouped import STAGE_ROW_WORDS, grouped_gemm, grouped_split_for, prepare_grouped_layer, quantize_activations_256  # noqa: F401  (0042: one kernel for every tile-type layer; the loader packs)
 from .iq3xxs_int8 import iq3xxs_int8_gemm
 from .iq4xs_int8 import iq4xs_int8_gemm
 from .q4k_int8 import q4k_int8_gemm
@@ -163,7 +163,7 @@ def gluon_mul_mat_tiles_grouped(x: torch.Tensor, packed: torch.Tensor, descs: li
             r1 = min(M, r0 + GLUON_MAX_ROWS_GROUPED)
             s = grouped_split_for(n_tiles, nb, m=r1 - r0, block_bytes=block_bytes)
             meta = {"nb": nb, "n_total": n_total, "desc": {s: descs[desc_splits.index(s)]}, "types": weight_types,
-                    "max_rw": max(TILE_TYPES[wt][1] // 4 for wt in weight_types)}   # 0043: the launcher's variant by types
+                    "max_rw": max(STAGE_ROW_WORDS[wt] for wt in weight_types)}   # 0043: the launcher's variant by types (the stage row: Q6_K, Q8_0 half a k-block)
             grouped_gemm(packed, meta, x[r0:r1], splitk=s, quantized=tuple(q[r0:r1] for q in xq), out=out[r0:r1], e=True,
                          bm=16 if r1 - r0 <= 16 else 32)
         return out
