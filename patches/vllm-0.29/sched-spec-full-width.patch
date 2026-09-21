@@ -1,0 +1,55 @@
+A speculative decode row is scheduled at its full width or not in this step.
+
+The running-request loop trims a request's tokens to what the step budget
+leaves: min(num_new_tokens, token_budget, input_budget - draft_slots). For a
+row that carries draft tokens the trimmed step verifies fewer than
+1 + num_spec tokens. The GDN kernels locate a request's recurrent state by the
+accepted-token count of the previous step (num_accepted - 1 against the
+conv-state row in causal_conv1d.py and against the block-table columns in
+fused_recurrent.py / fused_sigmoid_gating.py); that arithmetic holds when
+every verified step carried 1 + num_spec tokens. After a trimmed step the
+count of the previous step can exceed the width of the current one: the
+PR-50021 masks then read column 0 (zero output, no state stored) and the
+conv-state shift reads past the row inside the tensor. The scheduler's own
+comment on the async max_tokens check states the intent: "We don't schedule
+partial draft tokens since this prevents uniform decode optimizations."
+
+The trim occurs when a prefill chunk scheduled earlier in the same step
+leaves 2..num_spec tokens of budget (a last chunk of 2041-2046 tokens at
+max_num_batched_tokens 2048): the decode row that follows in `running` is cut
+to that leftover. With the guard the row is skipped for the step, as it is at
+budget 0, and runs at full width in the next one. The max_model_len bound
+that follows still trims, because the request ends within those tokens.
+
+Cut against the tree this series leaves (scheduler.py is last touched by
+mamba-resume-block-size). Replaces gdn-active-runtime-k-width, whose narrowing
+of the state-index tensors to the step's width turned the trimmed step into
+zeroed GDN output (and, on the full-CUDA-graph path, into a non-contiguous
+state_indices view the fused MTP op rejects); with every spec step at full
+width the num_spec + 1 columns are the layout the kernels index.
+
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -590,11 +590,22 @@
+                 + request.num_output_placeholders
+                 - request.num_computed_tokens
+             )
++            spec_step_width = num_new_tokens
+             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+             num_new_tokens = min(
+                 num_new_tokens, token_budget, input_budget - draft_slots
+             )
++            if request.spec_token_ids and num_new_tokens < spec_step_width:
++                # A speculative decode row runs at its full width (the bonus
++                # token and every draft) or waits for the next step, as it
++                # does at budget 0: the GDN kernels locate a request's state
++                # by its accepted-token count of the previous step against
++                # the conv-state row and the block-table columns, and that
++                # arithmetic assumes every verified step carried
++                # 1 + num_spec tokens. The max_model_len bound below still
++                # trims, since the request ends within those tokens.
++                num_new_tokens = 0
+ 
+             # Make sure the input position does not exceed the max model len.
+             # This is necessary when using spec decoding.
