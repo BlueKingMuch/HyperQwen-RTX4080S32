@@ -48,8 +48,8 @@ resolve_effective_config() {
   local ctx=${CTX:-} spec=${SPEC:-} kv=${KV:-}
   if [ "$mode" = "single" ]; then
     ctx=${ctx:-fast}; spec=${spec:-mtp}
-    case "$ctx" in fast|long|huge|fp8) ;;
-      *) _refuse "unknown CTX=$ctx (want fast|long|huge|fp8)" ;;
+    case "$ctx" in fast|long|huge|fp8|int4) ;;
+      *) _refuse "unknown CTX=$ctx (want fast|long|huge|fp8|int4)" ;;
     esac
     case "$spec" in mtp|dflash2|off|none) ;;
       *) _refuse "unknown SPEC=$spec (want mtp|dflash2|off|none)" ;;
