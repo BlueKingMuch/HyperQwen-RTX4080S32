@@ -23,16 +23,20 @@ sha256sum -c SHA256SUMS      # from inside this directory
 
 Two passes, GNU `patch` then `git apply`, both at `--fuzz 0`. The 0.28.0 checker
 can only afford its second pass on five patches; here all eighteen pass it,
-because all eighteen are exported from commits rooted at the tag rather than
-carried forward by hand. As measured: 18/18, zero hunks at an offset, zero at
-fuzz, `git diff --check` clean, 19 files touched, +1028/-80.
+because seventeen are exported from commits rooted at the tag rather than
+carried forward by hand, and the eighteenth (sched-spec-full-width) is cut
+against the tree the other seventeen leave. As measured: 18/18, zero hunks at
+an offset, zero at fuzz, `git diff --check` clean, 19 files touched,
++1025/-76.
 
 ## Provenance
 
-Each file is exported from one commit on a branch of vLLM rooted at `v0.29.0`,
-one commit per row below, subject `[qwen38] <topic>`, using the repository's own
-`scripts/export-patch.sh`. The commit is the source of truth and the file is
-generated from it:
+Each file but one is exported from one commit on a branch of vLLM rooted at
+`v0.29.0`, one commit per row below, subject `[qwen38] <topic>`, using the
+repository's own `scripts/export-patch.sh`. The commit is the source of truth
+and the file is generated from it (sched-spec-full-width is the exception: it
+is cut against the tree the other seventeen leave, its body identical in
+content to `patches/sched-spec-full-width.patch` of the build series):
 
 ```
 FORK_NAME=qwen38/0.29 bash scripts/export-patch.sh <fork checkout> <commit> \
@@ -60,7 +64,6 @@ column is not carried here; a guess in it would read like a commitment.
 | hybrid-kv-group-sizing | fix | a padded sliding-window bucket preferred over splitting one, so the smallest bucket does not set the page size for its group | none stated |
 | hybrid-kv-group-capacity-cost | fix | hybrid KV group layouts compared by allocator capacity cost, with `merge()` run on each real strided subset | none stated |
 | dflash2-request-topk-topp | feature | per-request top-k/top-p for the DFlash speculators under CUDA graphs, staged into capture-stable buffers | none |
-| gdn-active-runtime-k-width | fix | GDN spec masks sliced to the width the step uses, not the configured maximum | none stated |
 | dflash2-prewarm | fix | every reachable `BLOCK_SIZE` variant compiled at capture instead of inside the first long request | none stated |
 | triton-zero-length-segment-guard | fix | zero-length padding rows return a zero output row before the segment arithmetic, instead of entering `cdiv(0, 0)` | none stated |
 | triton-fp8-mq3d-qmax8 | feature | opt-in FP8 multi-query 3D Split-KV, off by default; registers `VLLM_TRITON_FP8_MQ3D` and `VLLM_TRITON_FP8_MQ3D_QMAX` | none |
@@ -68,6 +71,7 @@ column is not carried here; a guess in it would read like a commitment.
 | mq3d-mixed-target | feature | the FP8 MQ3D path on the target's attention only, draft unchanged; registers `VLLM_TRITON_FP8_MQ3D_MIXED_TARGET`, which does shape the graph | none |
 | block-verification-invalid-draft | fix | NaN/+inf proposals survive the reductions as invalid, the block is discarded, and the target sampler is reused directly | none stated |
 | mamba-resume-block-size | fix | Mamba state resumed in the Mamba group's own token geometry rather than the shared generic `block_size` | none stated |
+| sched-spec-full-width | fix | a speculative decode row is scheduled at its full width or waits for the next step, so the GDN kernels' accepted-token state offsets (`num_accepted - 1` against the conv-state row and the block-table columns) never meet a narrower step; replaces gdn-active-runtime-k-width, whose narrowing of the state-index tensors turned a budget-trimmed step into zeroed GDN output | none yet |
 
 Five knobs are registered in `envs.py` and read through `vllm.envs`, so they
 enter the torch.compile cache key: `VLLM_VISION_CPU_OFFLOAD_GB`,
@@ -100,7 +104,7 @@ tags. The 0.28.0 series minus its retired backport is 38 patches:
 | series | against v0.28.0 | against v0.29.0 |
 |---|---|---|
 | the 0.28.0 series (38) | **38/38** | 18/38 |
-| this series (18) | 12/18 | **18/18** |
+| this series (18) | 13/18 | **18/18** |
 
 The control matters: 38/38 on its own pin means the 20 failures on 0.29.0 are
 the version jump and not patches that were already stale.

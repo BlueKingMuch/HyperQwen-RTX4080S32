@@ -21,7 +21,6 @@ gdn-persistent-recovery-copy.patch
 hybrid-kv-group-sizing.patch
 hybrid-kv-group-capacity-cost.patch
 dflash2-request-topk-topp.patch
-gdn-active-runtime-k-width.patch
 dflash2-prewarm.patch
 triton-zero-length-segment-guard.patch
 triton-fp8-mq3d-qmax8.patch
@@ -29,3 +28,4 @@ triton-fp8-mq3d-dispatch-trace.patch
 mq3d-mixed-target.patch
 block-verification-invalid-draft.patch
 mamba-resume-block-size.patch
+sched-spec-full-width.patch
