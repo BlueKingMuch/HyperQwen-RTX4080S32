@@ -60,7 +60,6 @@ gdn-spec-state-recovery-core.patch
 mamba-align-row-null-bounds.patch
 gdn-persistent-recovery-buffer.patch
 gdn-persistent-recovery-copy.patch
-gdn-active-runtime-k-width.patch
 triton-fp8-mq3d-qmax8.patch
 triton-fp8-mq3d-dispatch-trace.patch
 mq3d-mixed-target.patch
@@ -82,3 +81,8 @@ int4-prefill-dequant-fa2.patch
 # leaves behind, so this entry stays last.
 renderer-clamp-max-tokens.patch
 bench-sse-keepalive-frames.patch
+
+# --- Scheduler ----------------------------------------------------------------
+# scheduler.py is last touched by engine-completion-log; cut against the tree the
+# whole series above leaves. Replaces gdn-active-runtime-k-width (removed).
+sched-spec-full-width.patch
