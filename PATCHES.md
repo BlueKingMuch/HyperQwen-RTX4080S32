@@ -97,7 +97,7 @@ Below the `# --- Ada additions ---` header in `patches/series`, applied after ev
 | mamba-align-row-null-bounds | fix | accepted-token block-table columns masked against the request's own row width | none yet | 0.29.0 + the series above | upstream PR |
 | gdn-persistent-recovery-buffer | own | the source-index buffer allocated once on the builder, so it survives graph capture | none | 0.29.0 + the series above | rides with gdn-spec-state-recovery-core |
 | gdn-persistent-recovery-copy | own | that buffer filled during metadata build | none | 0.29.0 + the series above | rides with gdn-spec-state-recovery-core |
-| gdn-active-runtime-k-width | own | spec masks sliced to the width the step uses | none | 0.29.0 + the series above | rides with gdn-spec-state-recovery-core |
+| sched-spec-full-width | fix | a speculative decode row is scheduled at its full width or waits for the next step, so the GDN kernels' accepted-token state offsets never meet a narrower step (replaces gdn-active-runtime-k-width; last in `patches/series`) | none yet | 0.29.0 + the series above | upstream PR |
 | triton-fp8-mq3d-qmax8 | feature | opt-in FP8 multi-query 3D Split-KV; registers `VLLM_TRITON_FP8_MQ3D`, `_QMAX` | none | 0.29.0 + the series above | upstreamed |
 | triton-fp8-mq3d-dispatch-trace | feature | opt-in INFO-once 2D/3D dispatch screening | none | 0.29.0 + the series above | rides with triton-fp8-mq3d-qmax8 |
 | mq3d-mixed-target | feature | the FP8 MQ3D path on the target's attention only; registers `VLLM_TRITON_FP8_MQ3D_MIXED_TARGET` | none | 0.29.0 + the series above | rides with triton-fp8-mq3d-qmax8 |
