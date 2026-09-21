@@ -1,0 +1,410 @@
+INT4 prefill chunks: dequantize the cached K/V per layer, run FlashAttention-2.
+
+The packed int4 kernel in v1/attention/ops/int4_per_token_head.py runs
+prefill chunks in its 2D mode: one query block of BLOCK_Q tokens per CTA,
+each streaming and unpacking the whole KV range of the request. At 100k
+context and 1,024 query tokens that is 2.5 TFLOP against 1.7 GB of KV per
+layer, compute-bound, and the kernel sits at a third of the HMMA rate FA2
+reaches on the same work (56.5 ms per layer against FA2's 30.1 with the
+tensor-core patch; 110 ms before it).
+
+This patch adds a second route for exactly those batches: for every request,
+a Triton kernel writes the request's cached K and V (all seqused_k tokens,
+the current chunk included) into two contiguous bf16 buffers, undoing the
+writer per (token, head): nibbles to values, minus the 4-bit zero point in
+the scale's low mantissa bits, times the scale, even/odd lanes interleaved
+back to head order. The values stay rotated, as stored; Q is rotated and
+the output un-rotated by the existing entry point. Then FA2 varlen runs on
+the buffers with the request's own cu_seqlens_k, causal aligned to the last
+positions like the packed kernel. The route is taken only when every request
+of the batch is longer than the 3D cap (max_query_len_3d, default 16) and
+none of softcap, sinks, alibi, qq_bias, output_scale, mm_prefix_range or
+per-sequence causal flags is set; everything else, decode and verify batches
+in particular, is unchanged and never reaches the .tolist() sync.
+
+Buffers: 2 x alloc_len x num_kv_heads x head_size in the query dtype, where
+alloc_len is the block table's capacity; 1.07 GB at 262,144 max-model-len.
+They come from the workspace manager, reserved on the first call of the
+entry point (the profile run) while it is unlocked, so the pool accounts for
+them; without a manager, or if it is locked, they are plain allocations.
+
+Measured on an RTX 4080 SUPER, 100k context, one layer, real writer:
+
+  query tokens   FA2 bf16   packed kernel   this route   rel. RMS vs packed
+  1024           30.1 ms    56.8 ms         29.3 ms      0.0089
+  2048           59.3 ms    102.4 ms        57.1 ms      0.0089
+
+The 0.0089 is the packed kernel's own int8 Q rounding (0.0082 against an
+fp32 reference); against the bf16 FA2 reference both are at 0.174, the
+quantization noise of the cache on random data.
+In the server (torch profiler, 100k prompt, DFlash2 k=7, per layer):
+
+  prefill chunk, 1,698 tokens   packed kernel 85.5 ms   dequant 0.8 ms + FA2 49.0 ms
+  prefill chunk,   432 tokens   packed kernel 28.4 ms   dequant 0.8 ms + FA2 16.2 ms
+  verify, grid [1,4,16]         0.690 ms before and after (route not taken)
+
+bench/labd_bench.py, 100k context, same session:
+
+  first prefill of the 100k prompt   before 96 s    after 79 s    (bf16 arm 77 s)
+  TTFT on the cached prompt          before 3.2 s   after 2.45 s  (bf16 arm 0.8 s; the
+                                     remainder is the hybrid block rule: 2,126 of the
+                                     tokens are recomputed at B = 1696)
+  decode                             unchanged, copy 41.3 ms/step, 66.2 tok/s
+
+KV pool at 262,144 max-model-len: 615,931 -> 564,071 tokens (the buffers).
+
+--- a/v1/attention/ops/int4_per_token_head.py
++++ b/v1/attention/ops/int4_per_token_head.py
+@@ -1023,6 +1023,314 @@
+     )
+ 
+ 
++# ----------------------------------------------------------------------
++# Prefill route: dequantize the request's cached K/V once per layer and
++# run FlashAttention-2 on it. The packed kernel above streams the whole KV
++# range once per query block and is compute-bound at prefill lengths.
++# ----------------------------------------------------------------------
++
++
++@triton.jit
++def _dequant_int4_kernel(
++    key_cache_ptr,
++    value_cache_ptr,
++    k_scale_cache_ptr,
++    v_scale_cache_ptr,
++    block_table_ptr,
++    k_out_ptr,
++    v_out_ptr,
++    stride_kc_blk: tl.int64,
++    stride_kc_slot: tl.int64,
++    stride_kc_head: tl.int64,
++    stride_vc_blk: tl.int64,
++    stride_vc_slot: tl.int64,
++    stride_vc_head: tl.int64,
++    stride_ks_blk: tl.int64,
++    stride_ks_slot: tl.int64,
++    stride_ks_head: tl.int64,
++    stride_vs_blk: tl.int64,
++    stride_vs_slot: tl.int64,
++    stride_vs_head: tl.int64,
++    stride_ko_tok: tl.int64,
++    stride_ko_head: tl.int64,
++    stride_vo_tok: tl.int64,
++    stride_vo_head: tl.int64,
++    block_size: tl.constexpr,
++    head_size: tl.constexpr,
++    head_size_v: tl.constexpr,
++    PACKED_HEAD_PADDED: tl.constexpr,
++):
++    """Inverse of _reshape_cache_int4_kernel for one (token, head): K/V come
++    out rotated, exactly as stored (the reader rotates Q and un-rotates the
++    output), in the dtype of the output buffers."""
++    tok = tl.program_id(0)
++    head = tl.program_id(1)
++    phys = tl.load(block_table_ptr + tok // block_size).to(tl.int64)
++    slot = tok % block_size
++
++    half_offs = tl.arange(0, PACKED_HEAD_PADDED)
++    even_offs = half_offs * 2
++    odd_offs = half_offs * 2 + 1
++
++    k_packed = tl.load(
++        key_cache_ptr
++        + phys * stride_kc_blk
++        + slot * stride_kc_slot
++        + head * stride_kc_head
++        + half_offs,
++        mask=half_offs < head_size // 2,
++        other=0,
++    )
++    k_even_u, k_odd_u = unpack_int4_nibbles(k_packed)
++    ks_bits = tl.load(
++        k_scale_cache_ptr
++        + phys * stride_ks_blk
++        + slot * stride_ks_slot
++        + head * stride_ks_head
++    ).to(tl.int32, bitcast=True)
++    k_zp = (ks_bits & 0xF).to(tl.float32)
++    k_scale = (ks_bits & -16).to(tl.float32, bitcast=True)
++    k_base = k_out_ptr + tok * stride_ko_tok + head * stride_ko_head
++    tl.store(
++        k_base + even_offs,
++        ((k_even_u.to(tl.float32) - k_zp) * k_scale).to(k_out_ptr.dtype.element_ty),
++        mask=even_offs < head_size,
++    )
++    tl.store(
++        k_base + odd_offs,
++        ((k_odd_u.to(tl.float32) - k_zp) * k_scale).to(k_out_ptr.dtype.element_ty),
++        mask=odd_offs < head_size,
++    )
++
++    v_packed = tl.load(
++        value_cache_ptr
++        + phys * stride_vc_blk
++        + slot * stride_vc_slot
++        + head * stride_vc_head
++        + half_offs,
++        mask=half_offs < head_size_v // 2,
++        other=0,
++    )
++    v_even_u, v_odd_u = unpack_int4_nibbles(v_packed)
++    vs_bits = tl.load(
++        v_scale_cache_ptr
++        + phys * stride_vs_blk
++        + slot * stride_vs_slot
++        + head * stride_vs_head
++    ).to(tl.int32, bitcast=True)
++    v_zp = (vs_bits & 0xF).to(tl.float32)
++    v_scale = (vs_bits & -16).to(tl.float32, bitcast=True)
++    v_base = v_out_ptr + tok * stride_vo_tok + head * stride_vo_head
++    tl.store(
++        v_base + even_offs,
++        ((v_even_u.to(tl.float32) - v_zp) * v_scale).to(v_out_ptr.dtype.element_ty),
++        mask=even_offs < head_size_v,
++    )
++    tl.store(
++        v_base + odd_offs,
++        ((v_odd_u.to(tl.float32) - v_zp) * v_scale).to(v_out_ptr.dtype.element_ty),
++        mask=odd_offs < head_size_v,
++    )
++
++
++_FA2_VARLEN = None
++_PREFILL_BUFFERS: dict = {}
++
++
++def _fa2_varlen():
++    """FlashAttention-2 varlen entry point, or None where the wheel has none."""
++    global _FA2_VARLEN
++    if _FA2_VARLEN is None:
++        try:
++            from vllm.v1.attention.backends.fa_utils import (
++                flash_attn_varlen_func,
++                is_flash_attn_varlen_func_available,
++            )
++
++            _FA2_VARLEN = (
++                flash_attn_varlen_func if is_flash_attn_varlen_func_available() else False
++            )
++        except Exception:
++            _FA2_VARLEN = False
++    return _FA2_VARLEN or None
++
++
++def _prefill_buffers(alloc_len, num_kv_heads, head_size, head_size_v, dtype, device):
++    """Two [alloc_len, Hkv, D] buffers for the dequantized K and V of one
++    request. From the workspace manager while it is unlocked (the first call
++    is the profile run, so the peak is accounted), else plain allocations."""
++    try:
++        from vllm.v1.worker.workspace import (
++            current_workspace_manager,
++            is_workspace_manager_initialized,
++        )
++
++        if is_workspace_manager_initialized():
++            return current_workspace_manager().get_simultaneous(
++                ((alloc_len, num_kv_heads, head_size), dtype),
++                ((alloc_len, num_kv_heads, head_size_v), dtype),
++            )
++    except Exception:
++        pass
++    key = (alloc_len, num_kv_heads, head_size, head_size_v, dtype, device)
++    if key not in _PREFILL_BUFFERS:
++        _PREFILL_BUFFERS[key] = (
++            torch.empty((alloc_len, num_kv_heads, head_size), dtype=dtype, device=device),
++            torch.empty((alloc_len, num_kv_heads, head_size_v), dtype=dtype, device=device),
++        )
++    return _PREFILL_BUFFERS[key]
++
++
++_PREFILL_RESERVED = False
++
++
++def _reserve_prefill_buffers(q, k_cache, v_cache, block_table):
++    """Called on every entry, acts once: size the dequant buffers for the
++    longest request the block table can describe while the workspace is
++    still unlocked (the profile run is the first caller), so serving never
++    grows it. If the manager is absent or locked, the plain allocation in
++    _prefill_buffers takes over later."""
++    global _PREFILL_RESERVED
++    if _PREFILL_RESERVED:
++        return
++    _PREFILL_RESERVED = True
++    scale_pad = 4
++    head_size_v = (v_cache.shape[3] - scale_pad) * 2
++    try:
++        _prefill_buffers(
++            block_table.shape[1] * k_cache.shape[1],
++            k_cache.shape[2],
++            q.shape[2],
++            head_size_v,
++            q.dtype,
++            q.device,
++        )
++    except Exception:
++        pass
++
++
++def _fa2_prefill_int4(
++    *,
++    q,
++    k_cache,
++    v_cache,
++    out,
++    cu_seqlens_q,
++    seqused_k,
++    softmax_scale,
++    window_size,
++    block_table,
++    k_scale_cache,
++    v_scale_cache,
++    use_causal,
++):
++    """Per request: dequantize its cached K/V (all seqused_k tokens, the
++    current chunk included) into contiguous buffers, then FA2 varlen with the
++    same causal alignment the packed kernel uses (queries are the last
++    positions of the sequence)."""
++    fa2 = _fa2_varlen()
++    num_kv_heads = k_cache.shape[2]
++    head_size = q.shape[2]
++    scale_pad = 4  # one fp32 scale after each head's packed nibbles
++    head_size_v = (v_cache.shape[3] - scale_pad) * 2
++    block_size = k_cache.shape[1]
++    packed_padded = triton.next_power_of_2(max(head_size, head_size_v) // 2)
++    cu = cu_seqlens_q.tolist()
++    seq_lens = seqused_k.tolist()
++    alloc_len = block_table.shape[1] * block_size
++    k_buf, v_buf = _prefill_buffers(
++        alloc_len, num_kv_heads, head_size, head_size_v, q.dtype, q.device
++    )
++    ws = None if window_size[0] < 0 and window_size[1] < 0 else list(window_size)
++    for i, seq_len in enumerate(seq_lens):
++        q0, q1 = cu[i], cu[i + 1]
++        q_len = q1 - q0
++        if q_len == 0 or seq_len == 0:
++            continue
++        k_i = k_buf[:seq_len]
++        v_i = v_buf[:seq_len]
++        _dequant_int4_kernel[(seq_len, num_kv_heads)](
++            k_cache,
++            v_cache,
++            k_scale_cache,
++            v_scale_cache,
++            block_table[i],
++            k_i,
++            v_i,
++            k_cache.stride(0),
++            k_cache.stride(1),
++            k_cache.stride(2),
++            v_cache.stride(0),
++            v_cache.stride(1),
++            v_cache.stride(2),
++            k_scale_cache.stride(0),
++            k_scale_cache.stride(1),
++            k_scale_cache.stride(2),
++            v_scale_cache.stride(0),
++            v_scale_cache.stride(1),
++            v_scale_cache.stride(2),
++            k_i.stride(0),
++            k_i.stride(1),
++            v_i.stride(0),
++            v_i.stride(1),
++            block_size=block_size,
++            head_size=head_size,
++            head_size_v=head_size_v,
++            PACKED_HEAD_PADDED=packed_padded,
++            num_warps=4,
++        )
++        cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=q.device)
++        cu_k = torch.tensor([0, seq_len], dtype=torch.int32, device=q.device)
++        fa2(
++            q[q0:q1],
++            k_i,
++            v_i,
++            q_len,
++            cu_q,
++            seq_len,
++            cu_seqlens_k=cu_k,
++            softmax_scale=softmax_scale,
++            causal=use_causal,
++            window_size=ws,
++            out=out[q0:q1],
++            fa_version=2,
++        )
++
++
++def _fa2_prefill_route(
++    max_seqlen_q,
++    max_query_len_3d,
++    cu_seqlens_q,
++    softcap,
++    sinks,
++    alibi_slopes,
++    qq_bias,
++    output_scale,
++    mm_prefix_range,
++    per_seq_causal_ptr,
++):
++    """True when every request of the batch is longer than the 3D cap (so the
++    packed kernel would run in 2D) and nothing is set that FA2 varlen cannot
++    express. Decode and verify batches never reach the .tolist() sync."""
++    cap = max_query_len_3d if max_query_len_3d is not None else 16
++    if max_seqlen_q <= cap:
++        return False
++    if (
++        softcap
++        or sinks is not None
++        or alibi_slopes is not None
++        or qq_bias is not None
++        or output_scale is not None
++        or mm_prefix_range is not None
++        or per_seq_causal_ptr is not None
++        or _fa2_varlen() is None
++    ):
++        return False
++    cu = cu_seqlens_q.tolist()
++    return all(cu[i + 1] - cu[i] > cap for i in range(len(cu) - 1) if cu[i + 1] > cu[i])
++
++
++
+ def unified_attention_int4(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+@@ -1066,6 +1374,37 @@
+     head_size = q.shape[2]
+     softmax_scale = softmax_scale / head_size
+ 
++    _reserve_prefill_buffers(q, k_cache, v_cache, block_table)
++    if _fa2_prefill_route(
++        max_seqlen_q,
++        max_query_len_3d,
++        cu_seqlens_q,
++        softcap,
++        sinks,
++        alibi_slopes,
++        qq_bias,
++        output_scale,
++        mm_prefix_range,
++        per_seq_causal_ptr,
++    ):
++        _fa2_prefill_int4(
++            q=q,
++            k_cache=k_cache,
++            v_cache=v_cache,
++            out=out,
++            cu_seqlens_q=cu_seqlens_q,
++            seqused_k=seqused_k,
++            softmax_scale=softmax_scale,
++            window_size=window_size,
++            block_table=block_table,
++            k_scale_cache=k_scale_cache,
++            v_scale_cache=v_scale_cache,
++            use_causal=use_causal,
++        )
++        out_f = single_rht(out.float(), inverse=True) / head_size
++        out.copy_(out_f.to(q_orig_dtype))
++        return
++
+     _launch_packed_attn(
+         q=q,
+         k_cache=k_cache,
