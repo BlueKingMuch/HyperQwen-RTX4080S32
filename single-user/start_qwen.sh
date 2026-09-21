@@ -148,6 +148,13 @@ API_SERVERS=${API_SERVERS:-1}
 #          block size 896, the same 64k window as CTX=fast, 7 drafts. What the
 #          dtype buys here is the pool, not the window. The set is off on every
 #          other CTX because none of it applies to FlashAttention or FlashInfer.
+# CTX=int4: int4 per-token-head KV on TRITON_ATTN (patches int4-attn-int8qk-bf16pv
+#           and int4-prefill-dequant-fa2), 262k window, DFlash2 with 7 drafts. The
+#           drafter keeps an int8 per-token-head cache (SPEC_KV): 2112 B per token
+#           is 8 x 264 B, the int4 cell, so its page divides the int4 page at block
+#           1696 and nothing is promoted or padded. Measured on the 32 GB card,
+#           100k context: 39.9 ms per decode step against bf16's 39.5, first
+#           prefill 79 s against 77, pool 574,889 tokens at 262144.
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/ in this repo, run kvarn/install.sh
 #           once), 200k context with MTP. The decode tax is a function of context,
 #           not a constant: ~6% on short prompts, but 2.13x at 112k (32.0 vs fp8's
@@ -214,6 +221,16 @@ elif [ "$CTX" = "fp8" ]; then
     # per-tensor fp8 cache on TRITON_ATTN, and its gate is checked first in
     # TritonAttentionImpl.forward(). At 1 the FP8 MQ3D path does not run.
   export VLLM_SPEC_DECODE_ATTN=${SPEC_ATTN:-0}
+elif [ "$CTX" = "int4" ]; then
+  MAX_LEN=${MAX_LEN:-262144}
+  MAX_SEQS=${MAX_SEQS:-8}
+  GPU_UTIL=${GPU_UTIL:-0.88}
+  DRAFT_TOKENS=${DRAFT_TOKENS:-7}
+  MAX_BATCHED=${MAX_BATCHED:-2048}
+  ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype int4_per_token_head"
+  # The multi-query 3D verify path of the int4 kernel; INT4_MQ_3D=0 keeps the 2D path.
+  export VLLM_INT4_MQ_3D=${INT4_MQ_3D:-1}
+  export VLLM_SPEC_DECODE_ATTN=${SPEC_ATTN:-0}
 fi
 # FP8_KERNELS=1 is the default under CTX=fp8 and off everywhere else: the four
 # steps fp8/install.sh puts in the venv do nothing on any other backend, and
@@ -248,8 +265,14 @@ elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "fp8" ]; then
     # sides of the verify step.
   SPEC_KV=${SPEC_KV:-fp8_e4m3}
   SPEC_BACKEND=${SPEC_BACKEND:-TRITON_ATTN}
+elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "int4" ]; then
+  # Not the target's int4: the drafter's 8 heads x 136 B page does not divide the
+  # int4 page (1,790,976 B at block 1696), so vLLM promotes the drafter to block 1696
+  # and pads the target; 8 x 264 B does divide it, 53 times.
+  SPEC_KV=${SPEC_KV:-int8_per_token_head}
+  SPEC_BACKEND=${SPEC_BACKEND:-TRITON_ATTN}
 elif [ "$SPEC" = "dflash2" ] && [ "$CTX" != "fast" ]; then
-  echo "SPEC=dflash2 supports CTX=fast (bf16, 64k), CTX=long (int8, 128k), CTX=huge (KVarN, 240k; kvarn/install.sh) and CTX=fp8 (fp8 on TRITON_ATTN, 262k); CTX=$CTX keeps SPEC=mtp" >&2
+  echo "SPEC=dflash2 supports CTX=fast (bf16, 64k), CTX=long (int8, 128k), CTX=huge (KVarN, 240k; kvarn/install.sh) CTX=fp8 (fp8 on TRITON_ATTN, 262k) and CTX=int4 (int4 per-token-head on TRITON_ATTN, 262k); CTX=$CTX keeps SPEC=mtp" >&2
   SPEC=mtp
 fi
 # gotcha 51 / #64: KVarN + MTP + prefix caching, all three, corrupts prompt_logprobs --
@@ -430,6 +453,13 @@ if [ "$SPEC" = "dflash2" ]; then
     # a larger card gets the pool it has room for rather than the one a 3090 had.
     MAX_SEQS=${MAX_SEQS:-8}
     MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-65536}}
+    KV_MEM=${KV_MEM-}
+  elif [ "$CTX" = "int4" ]; then
+    # No pinned KV_MEM: the pool comes from GPU_UTIL. 574,889 tokens at 262144
+    # max-model-len on the 32 GB card with the drafter on int8 per-token-head,
+    # 1.07 GB of it reserved for the prefill dequant buffers.
+    MAX_SEQS=${MAX_SEQS:-8}
+    MAX_LEN=${DFLASH_MAX_LEN:-${USER_MAX_LEN:-262144}}
     KV_MEM=${KV_MEM-}
   elif [ "$CTX" = "long" ]; then
     # int8 KV: measured 136,429 tokens of pool at DFLASH_TOKENS=7 with prefix caching on

@@ -71,6 +71,11 @@ block-verification-invalid-draft.patch
 # Cut against the tree the series above leaves behind. int4_per_token_head.py is
 # last touched by spec-decode-scratch-within-budget, and nothing below reads it.
 int4-noncausal-tile-bounds.patch
+# int4_per_token_head.py is last touched by int4-noncausal-tile-bounds; this sits
+# after it and nothing below reads the file.
+int4-attn-int8qk-bf16pv.patch
+# Same file, cut against the tree int4-attn-int8qk-bf16pv leaves; nothing below reads it.
+int4-prefill-dequant-fa2.patch
 
 # --- Upstream fixes -----------------------------------------------------------
 # Open upstream, carried here. Cut against the tree the whole series above

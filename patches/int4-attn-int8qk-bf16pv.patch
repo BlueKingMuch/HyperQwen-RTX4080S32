@@ -1,0 +1,129 @@
+INT4 verify attention on tensor cores: int8 Q.K, bf16 P.V, one query block.
+
+v1/attention/ops/int4_per_token_head.py converts the unpacked nibbles, the
+query rows and the softmax probabilities to fp32 before tl.dot. On sm_89 an
+fp32 tl.dot runs on TF32 tensor cores (10-bit mantissa), while the zero-point
+correction next to it (Q_sum * k_zp, Pv_zp_sum) stays fp32, so the two terms
+of each subtraction are rounded differently. BLOCK_M is 16 for GQA groups up
+to 16; with 6 query heads per KV head that is BLOCK_Q = 2 query tokens per
+block, so an 8-token verify batch launches 4 query blocks per KV head and each
+of them streams the whole KV range.
+
+This patch quantizes each query row to int8 (scale = absmax / 127, rounded)
+after the RHT, takes K as int8 (the nibbles 0..15 are exact), computes Q.K as
+an int32 dot and applies q_scale, k_scale and the zero-point term afterwards;
+P and V go to the P.V dot as bf16 (V exact in bf16), accumulation stays fp32.
+BLOCK_M becomes 64 (BLOCK_Q = 10, one block per request), TILE_SIZE_DECODE 64,
+TILE_SIZE_PREFILL 128 (was 32), num_warps 8. The writer is unchanged.
+
+Measured on an RTX 4080 SUPER, 100k context, 16 layers in one CUDA graph,
+16 separate caches written by reshape_and_cache_int4, warm clock, median of 9:
+
+  kernel                                   ms/step   GB/s   registers / spills
+  bf16 split-KV verify (spec_decode_attn)  12.0-12.4   530
+  int4 before                              32.1-33.1    53   168 / 0    (4 warps)
+  int4 after                               11.3-11.5   147   255 / 16   (8 warps)
+
+  bytes per step: bf16 6.55 GB, int4 1.69 GB
+
+Against the same kernel with input_precision="ieee" on all four dots (fp32
+FMA, no TF32), same quantized inputs, random N(0,1) K/V, one layer, 100k:
+
+  before   rel. RMS 0.187
+  after    rel. RMS 0.0082   (bf16 operands without int8 Q.K: 0.0040)
+
+Prefill remainder on 100k context (2D path, per layer), FA2 bf16 as reference:
+  1024 query tokens   FA2 29.6-31.2 ms   int4 before 110-113 ms   after 56.5 ms
+  2048 query tokens   FA2 59.6 ms        int4 before 220 ms       after 103 ms
+(prefill tile 32 -> 64: 79.6 -> 57.4 ms; 128: 56.5; 256: 112.7; BLOCK_M 128 spills)
+In the server (torch profiler, 100k prompt, DFlash2 k=7, median per launch):
+
+  target verify, grid [1,4,16]     before 1.964 ms   after 0.690 ms   (bf16 split-KV 0.714)
+  drafter (5 layers, own int4 KV)  before 0.218 ms   after 0.211 ms
+  prefill chunk, 1,698 tokens      before 225.8 ms   after 116.0 ms   per layer
+  prefill chunk, 432 tokens        before  62.5 ms   after  39.4 ms   per layer
+
+bench/labd_bench.py, 100k context, same session (bf16 arm: 65.5 tok/s, copy 39.5 ms/step):
+
+  int4 before   44.1 tok/s   2.73 tok/step   copy 62.9 ms/step   TTFT cached 6.0 s
+  int4 after    71.6 tok/s   2.98 tok/step   copy 41.9 ms/step   TTFT cached 3.9 s
+
+--- a/v1/attention/ops/int4_per_token_head.py
++++ b/v1/attention/ops/int4_per_token_head.py
+@@ -476,7 +476,11 @@
+     ).to(tl.float32)
+ 
+     # INT4 asymmetric correction needs sum(Q) per row.
+-    Q_sum = tl.sum(Q_s0, axis=1) + tl.sum(Q_s1, axis=1)
++    q_absmax = tl.maximum(tl.max(tl.abs(Q_s0), axis=1), tl.max(tl.abs(Q_s1), axis=1))
++    q_scale = tl.where(q_absmax > 0, q_absmax / 127.0, 1.0)
++    Q_s0 = tl.floor(Q_s0 / q_scale[:, None] + 0.5).to(tl.int8)
++    Q_s1 = tl.floor(Q_s1 / q_scale[:, None] + 0.5).to(tl.int8)
++    Q_sum = tl.sum(Q_s0.to(tl.float32), axis=1) + tl.sum(Q_s1.to(tl.float32), axis=1)
+ 
+     block_table_offset = seq_idx * block_table_stride
+ 
+@@ -553,11 +557,11 @@
+         # Dequantize KV.  INT4 unpacks nibbles as plain uint [0..15];
+         # the zero-point is applied on the score side.
+         K_s0_u, K_s1_u = unpack_int4_nibbles(K_packed)
+-        K_s0 = K_s0_u.to(tl.float32)
+-        K_s1 = K_s1_u.to(tl.float32)
++        K_s0 = K_s0_u.to(tl.int8)
++        K_s1 = K_s1_u.to(tl.int8)
+         V_s0_u, V_s1_u = unpack_int4_nibbles(V_packed)
+-        V_s0 = V_s0_u.to(tl.float32)
+-        V_s1 = V_s1_u.to(tl.float32)
++        V_s0 = V_s0_u.to(tl.bfloat16)
++        V_s1 = V_s1_u.to(tl.bfloat16)
+ 
+         ks_idx = (
+             physical_block_idx * stride_ks_blk
+@@ -600,9 +604,9 @@
+         # softmax_scale * per-(token, head) k_scale in one mul.  INT4
+         # subtracts the ``zp * sum(Q)`` correction term.
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+-        raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)
++        raw_dot = (tl.dot(Q_s0, K_s0, out_dtype=tl.int32) + tl.dot(Q_s1, K_s1, out_dtype=tl.int32)).to(tl.float32)
+         S += (raw_dot - Q_sum[:, None] * k_zp[None, :]) * (
+-            scale * k_token_head_scales[None, :]
++            scale * q_scale[:, None] * k_token_head_scales[None, :]
+         )
+ 
+         if USE_SOFTCAP:
+@@ -634,7 +638,7 @@
+ 
+         # Fuse v per-(token, head) scale into P.  INT4 also subtracts
+         # the v-zero-point contribution from each stream once.
+-        P_v = (P * v_token_head_scales[None, :]).to(tl.float32)
++        P_v = (P * v_token_head_scales[None, :]).to(tl.bfloat16)
+         Pv_zp_sum = tl.sum(P_v * v_zp[None, :], axis=1)
+         acc_s0 += tl.dot(P_v, V_s0) - Pv_zp_sum[:, None]
+         acc_s1 += tl.dot(P_v, V_s1) - Pv_zp_sum[:, None]
+@@ -757,7 +761,7 @@
+     head_size = q.shape[2]
+ 
+     BLOCK_M = (
+-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
++        64 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+     )
+     BLOCK_Q = BLOCK_M // num_queries_per_kv
+     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+@@ -777,6 +781,8 @@
+     # silently relied on for scratch-buffer capacity; multi-query breaks that
+     # equivalence, so capacity is checked against the token-indexed scratch
+     # buffers directly. Opt-in via VLLM_INT4_MQ_3D=1 (promotion gates open).
++    TILE_SIZE_DECODE = 64
++    TILE_SIZE_PREFILL = 128
+     _mq = max_seqlen_q > 1
+     _mq_3d_enabled = envs.VLLM_INT4_MQ_3D
+ 
+@@ -956,7 +962,7 @@
+         BLOCK_M=BLOCK_M,
+         NUM_SEGMENTS_PER_SEQ=num_segments,
+         USE_FP8=output_scale is not None,
+-        IS_3D=use_3d,
++        IS_3D=use_3d, num_warps=8,
+         PACKING_FACTOR=packing_factor,
+         USE_CAUSAL=use_causal,
+         USE_PER_SEQ_CAUSAL=(per_seq_causal_ptr is not None),

@@ -48,6 +48,18 @@ What the dtype buys on this card is the pool: 308,331 KV tokens against bf16's
 reverse-byte proofs, and the one place where vLLM 0.29's scratch pool had to
 learn a second segment count.
 
+**`CTX=int4` — the int4 per-token-head KV cache on the Triton backend.** Two
+patches under the same header: the verify kernel feeds Q and K to the tensor
+cores as int8 and P and V as bf16 instead of fp32 on TF32, in one query block
+per request (kernel per launch at 100k: 1.964 ms to 0.690, against the bf16
+split-KV kernel's 0.714; 0.187 to 0.0082 rel. RMS against an fp32 reference),
+and prefill chunks dequantize the request's cached K/V per layer and run
+FlashAttention-2 on it (first 100k prefill 165 s to 79, bf16 77). The DFlash2
+drafter keeps an int8 per-token-head cache, whose page divides the int4 page
+at block 1696. On this card the arm decodes 100k context at 39.9 ms per step
+against bf16's 39.5 with 574,889 KV tokens at a 262k window; GSM8K over 200
+questions 0.945-0.955 against bf16's 0.965.
+
 **`gguf-plugin/` — the out-of-tree GGUF plugin, installed by default.** Pinned
 commit, ten patches, twenty-six Gluon decode kernels, its CUDA extension built
 for sm_89 and sm_120 at image build. None of the plugin's source is carried
