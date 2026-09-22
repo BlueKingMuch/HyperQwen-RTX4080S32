@@ -166,9 +166,9 @@ the A stages as the first allocation (Triton's allocator places the largest buff
 at offset 0) and the weight stages raw-addressed at word 16,384 of the second. Region
 8 is the 64-row form on four warps (64 KB), compiled, not dispatched. Rows 33–128
 stay on the 32-row blocks. A run with a Q4_K, Q5_K or IQ2_S shard keeps the
-dequant path (`GLUON_DEQUANT_TYPES`): Q4_K's min term is an outer product per
-sub-block and IQ2_S decodes with two mmas per sub-block, both at 0.7 × cuBLAS
-bf16 in the wide form; Q5_K's 44-word rows take the wide stages of regions 5–7.
+dequant path (`GLUON_DEQUANT_TYPES`): Q4_K and IQ2_S run at 0.7 × cuBLAS bf16 in
+the wide form, so dequantising and calling cuBLAS is 1.2 × faster for them; Q5_K's
+44-word rows take the wide stages of regions 5–7 and do not fit the wide forms.
 
 The decode launches are unchanged. Their M-block offset is a plain zero and
 folds away; the scale prefetch and the 16-byte swizzle are wide-form branches,
