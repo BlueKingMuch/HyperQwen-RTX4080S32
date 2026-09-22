@@ -20,6 +20,10 @@ full reproductions; the list below collects the shorter reports from issues.
   the FP8 attention steps and the GGUF plugin: six arms, KV pools, the
   768-token cap the quality harness never reports, and GSQ-RCO IQ3_S against
   W4A16 at one variable
+- [ada-gguf-int8-prefill.md](ada-gguf-int8-prefill.md) — the same card again,
+  one variable: the prefill chunk's GEMM moved off dequantised weights onto the
+  tiles. Cold 100k prefill 90.0 s → 71.1 s, the KV pool, GSM8K, and a passcode
+  at six depths of a 260k prompt with the prefix cache defeated at each
 
 ## Results from other hardware
 
