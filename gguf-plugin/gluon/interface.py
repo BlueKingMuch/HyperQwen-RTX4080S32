@@ -66,7 +66,8 @@ GLUON_TYPES = frozenset(_KERNELS)
 GLUON_INT8_TYPES = frozenset(_INT8_KERNELS)
 GLUON_MAX_ROWS = 16
 GLUON_MAX_ROWS_GROUPED = 32   # 0046: the grouped kernel's one launch (bm 16 up to 16 rows, bm 32 above)
-GLUON_ARRIVAL_ROWS = 128      # 0046: above one launch, 32-row blocks on the grouped kernel up to here, the dequant path beyond
+GLUON_ARRIVAL_ROWS = 128      # 0046: above one launch, 32-row blocks on the grouped kernel up to here
+GLUON_DEQUANT_TYPES = frozenset({12, 13, 22})   # 0047: a run with one of these keeps the dequant path above 128 rows - Q4_K (its min term an outer product per sub-block: 0.77-0.82x of dequant + cuBLAS bf16 at 2,048 rows), IQ2_S (0.73-0.79x), Q5_K (44-word rows: outside the wide forms)
 GLUON_TILE_TYPES = frozenset(TILE_TYPES)     # 0038: the types the loader holds tile-major (every int8 type)
 
 
@@ -147,8 +148,12 @@ def gluon_mul_mat_tiles_grouped(x: torch.Tensor, packed: torch.Tensor, descs: li
     for that row count (precomputed at load for 1..32 rows: a split outside the tables would build one inside the
     compiled graph), the type uniform per CTA selecting the compiled decode, every tile writing its own columns,
     the partials summed in one fp32 kernel; 33-128 rows as 32-row blocks on the same kernel (the arrival step);
-    above, the prefill path per shard (the dequantised tiles and cuBLAS, into the slice). The row-count dispatch
-    lives here, inside the op (lesson 7b)."""
+    above, the wide form (0047): one launch at split 1 over M-blocks of 128 rows (eight warps, the decoded
+    fragments feeding 128 rows of int8 mma; 1.4-1.7x the dequantised weights and cuBLAS bf16 on IQ4_XS / IQ3_S
+    at 2,048 rows), the activations
+    quantised once per 256 as below - unless the run has a shard of GLUON_DEQUANT_TYPES, which keeps the dequant
+    path per shard (the dequantised tiles and cuBLAS, into the slice). The row-count dispatch lives here,
+    inside the op (lesson 7b)."""
     M, K = int(x.shape[0]), int(x.shape[1])
     n_total = sum(n_outs)
     out = torch.empty((M, n_total), dtype=x.dtype, device=x.device)
@@ -166,6 +171,13 @@ def gluon_mul_mat_tiles_grouped(x: torch.Tensor, packed: torch.Tensor, descs: li
                     "max_rw": max(STAGE_ROW_WORDS[wt] for wt in weight_types)}   # 0043: the launcher's variant by types (the stage row: Q6_K, Q8_0 half a k-block)
             grouped_gemm(packed, meta, x[r0:r1], splitk=s, quantized=tuple(q[r0:r1] for q in xq), out=out[r0:r1], e=True,
                          bm=16 if r1 - r0 <= 16 else 32)
+        return out
+    if not (set(weight_types) & GLUON_DEQUANT_TYPES):
+        # 0047: the wide form - the whole chunk in one launch, split 1 (its table is prepared at load), bm 128
+        xq = quantize_activations_256(x.contiguous(), with_sums=True)
+        meta = {"nb": nb, "n_total": n_total, "desc": {1: descs[desc_splits.index(1)]}, "types": weight_types,
+                "max_rw": max(STAGE_ROW_WORDS[wt] for wt in weight_types)}
+        grouped_gemm(packed, meta, x, splitk=1, quantized=xq, out=out, e=True, bm=128)
         return out
     col = 0
     for t, n, wt in zip(tiles, n_outs, weight_types):

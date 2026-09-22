@@ -137,9 +137,13 @@ def single_gemm(tiles: torch.Tensor, x: torch.Tensor, n_out: int, wt: int, quant
     key = (tiles.data_ptr(), tuple(tiles.shape), wt)
     ent = _PACKS.get(key)
     if ent is None:
-        ent = pack_tiles([(tiles, n_out, wt)])
+        # the entry holds the tensor it was packed from: the key is that tensor's address, and a freed tensor's
+        # address is handed to the next allocation of the shape, which would read this shard's pack as its own
+        # (the entry already carries a copy of the bytes, so this costs the copy twice, never in serving - the
+        # tiles of a loaded layer live as long as the process)
+        ent = pack_tiles([(tiles, n_out, wt)]) + (tiles,)
         _PACKS[key] = ent
-    packed, meta = ent
+    packed, meta, _ = ent
     # `out` may be a column view of the caller's tensor; the partials' sum writes a contiguous target, so a strided view is
     # filled by a copy (splitk == 1 stores into the view directly)
     y = grouped_gemm(packed, meta, x, quantized=quantized, out=out if (out is None or out.is_contiguous()) else None, e=False)
