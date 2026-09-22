@@ -67,7 +67,7 @@ GLUON_INT8_TYPES = frozenset(_INT8_KERNELS)
 GLUON_MAX_ROWS = 16
 GLUON_MAX_ROWS_GROUPED = 32   # 0046: the grouped kernel's one launch (bm 16 up to 16 rows, bm 32 above)
 GLUON_ARRIVAL_ROWS = 128      # 0046: above one launch, 32-row blocks on the grouped kernel up to here
-GLUON_DEQUANT_TYPES = frozenset({12, 13, 22})   # 0047: a run with one of these keeps the dequant path above 128 rows - Q4_K (its min term an outer product per sub-block: 0.77-0.82x of dequant + cuBLAS bf16 at 2,048 rows), IQ2_S (0.73-0.79x), Q5_K (44-word rows: outside the wide forms)
+GLUON_DEQUANT_TYPES = frozenset({12, 13, 22})   # 0047: a run with one of these keeps the dequant path above 128 rows - Q4_K (0.77-0.82x of dequant + cuBLAS bf16 at 2,048 rows) and IQ2_S (0.73-0.79x) are slower in the wide form, Q5_K's 44-word rows do not fit it
 GLUON_TILE_TYPES = frozenset(TILE_TYPES)     # 0038: the types the loader holds tile-major (every int8 type)
 
 
