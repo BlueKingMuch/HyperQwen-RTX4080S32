@@ -147,21 +147,26 @@ def gluon_mul_mat_tiles_grouped(x: torch.Tensor, packed: torch.Tensor, descs: li
     mins take), one launch of the grouped kernel - bm 16 up to 16 rows, bm 32 above - at the split of the table
     for that row count (precomputed at load for 1..32 rows: a split outside the tables would build one inside the
     compiled graph), the type uniform per CTA selecting the compiled decode, every tile writing its own columns,
-    the partials summed in one fp32 kernel; 33-128 rows as 32-row blocks on the same kernel (the arrival step);
-    above, the wide form (0047): one launch at split 1 over M-blocks of 128 rows (eight warps, the decoded
-    fragments feeding 128 rows of int8 mma; 1.4-1.7x the dequantised weights and cuBLAS bf16 on IQ4_XS / IQ3_S
-    at 2,048 rows), the activations
-    quantised once per 256 as below - unless the run has a shard of GLUON_DEQUANT_TYPES, which keeps the dequant
-    path per shard (the dequantised tiles and cuBLAS, into the slice). The row-count dispatch lives here,
-    inside the op (lesson 7b)."""
+    the partials summed in one fp32 kernel. Above 32 rows the wide form (0047, 0050): one launch at split 1,
+    bm 64 up to 64 rows and bm 128 above, so the weights are streamed once for the whole batch instead of
+    ceil(M / 32) times - at 64 rows, the eight streams of a 7-token drafter, that is twice. Unless the run has
+    a shard of GLUON_DEQUANT_TYPES: those keep the 32-row blocks to 128 rows and the dequant path above (the
+    dequantised tiles and cuBLAS, into the slice). The row-count dispatch lives here, inside the op (lesson 7b)."""
     M, K = int(x.shape[0]), int(x.shape[1])
     n_total = sum(n_outs)
     out = torch.empty((M, n_total), dtype=x.dtype, device=x.device)
+    if M > GLUON_MAX_ROWS_GROUPED and not (set(weight_types) & GLUON_DEQUANT_TYPES):
+        # 0050: one wide launch for the whole batch. A C8 verify step is 64 rows and read the weights twice as
+        # 32-row blocks; one bm-64 launch reads them once. bm 128 above 64 rows keeps it at one M-block.
+        xq = quantize_activations_256(x.contiguous(), with_sums=True)
+        meta = {"nb": nb, "n_total": n_total, "desc": {1: descs[desc_splits.index(1)]}, "types": weight_types,
+                "max_rw": max(STAGE_ROW_WORDS[wt] for wt in weight_types)}
+        grouped_gemm(packed, meta, x, splitk=1, quantized=xq, out=out, e=True, bm=64 if M <= 64 else 128)
+        return out
     if M <= GLUON_ARRIVAL_ROWS:
         # 0046: up to 32 rows one launch (bm 16 up to 16 rows - 0044's launch to the byte - and bm 32 above: two mma
-        # row blocks per decoded fragment, the weights streamed once); 33-128 rows (the arrival step: a new prompt
-        # beside the running verify batches) as 32-row blocks on the same kernel, the weights streamed ceil(M / 32)
-        # times instead of the dequant path's 114 GB; the split of the table for the block's row count
+        # row blocks per decoded fragment, the weights streamed once); a run with a dequant type keeps the 32-row
+        # blocks to 128 rows, the weights streamed ceil(M / 32) times instead of the dequant path's 114 GB
         n_tiles = sum(-(-n // 64) for n in n_outs)
         xq = quantize_activations_256(x.contiguous(), with_sums=True)
         for r0 in range(0, M, GLUON_MAX_ROWS_GROUPED):
@@ -171,13 +176,6 @@ def gluon_mul_mat_tiles_grouped(x: torch.Tensor, packed: torch.Tensor, descs: li
                     "max_rw": max(STAGE_ROW_WORDS[wt] for wt in weight_types)}   # 0043: the launcher's variant by types (the stage row: Q6_K, Q8_0 half a k-block)
             grouped_gemm(packed, meta, x[r0:r1], splitk=s, quantized=tuple(q[r0:r1] for q in xq), out=out[r0:r1], e=True,
                          bm=16 if r1 - r0 <= 16 else 32)
-        return out
-    if not (set(weight_types) & GLUON_DEQUANT_TYPES):
-        # 0047: the wide form - the whole chunk in one launch, split 1 (its table is prepared at load), bm 128
-        xq = quantize_activations_256(x.contiguous(), with_sums=True)
-        meta = {"nb": nb, "n_total": n_total, "desc": {1: descs[desc_splits.index(1)]}, "types": weight_types,
-                "max_rw": max(STAGE_ROW_WORDS[wt] for wt in weight_types)}
-        grouped_gemm(packed, meta, x, splitk=1, quantized=xq, out=out, e=True, bm=128)
         return out
     col = 0
     for t, n, wt in zip(tiles, n_outs, weight_types):
