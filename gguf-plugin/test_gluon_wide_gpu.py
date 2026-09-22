@@ -121,9 +121,10 @@ def check_mixed(dev, rng):
 
 
 def check_dispatch(dev, rng):
-    """The op above 128 rows (gluon_mul_mat_tiles_grouped, the loader's tables): a run of wide-form shards must
-    come out of the wide launch bit-identical to the 32-row form, and a run holding one of GLUON_DEQUANT_TYPES
-    must come out of the dequant path (bf16 cuBLAS on the dequantised tiles, so only close)."""
+    """The op above 32 rows (gluon_mul_mat_tiles_grouped, the loader's tables): a run of wide-form shards must
+    come out of one wide launch bit-identical to the 32-row form at every row count, and a run holding one of
+    GLUON_DEQUANT_TYPES must come out of the 32-row blocks up to 128 rows and the dequant path above (bf16
+    cuBLAS on the dequantised tiles, so only close)."""
     K = 1280
     for parts, wide in (([(23, 130), (21, 192)], True), ([(23, 130), (12, 192)], False)):
         raws = [(random_raw(rng, n, K, wt), wt) for wt, n in parts]
@@ -133,7 +134,7 @@ def check_dispatch(dev, rng):
             fail("the loader's tables carry no split 1")
         W = torch.cat([torch.from_numpy(gguf_dequantize(raw, GTYPE[wt]).astype(np.float64)) for raw, wt in raws], dim=0).to(dev)
         name = " + ".join(NAMES[wt] for wt, _ in parts)
-        for M in (129, 300):
+        for M in (33, 64, 65, 129, 300):
             X = (torch.randn(M, K, device=dev) * 0.5).to(torch.bfloat16)
             y = gi.gluon_mul_mat_tiles_grouped(X, packed, descs, splits, views, [n for _, n in parts], [wt for wt, _ in parts], nb, block_bytes)
             xq = tg.quantize_activations_256(X, with_sums=True)
@@ -144,8 +145,9 @@ def check_dispatch(dev, rng):
             torch.cuda.synchronize()
             neq = int((y != ref).sum())
             e = rel_err(y, fp)
-            ok = (neq == 0) if wide else (e < 5e-2)
-            print(f"dispatch {name:18} M {M:4} | {'wide form' if wide else 'dequant path'}: differs from the 32-row form in {neq} of {y.numel()}, rel to fp64 {e:.1e}", flush=True)
+            ok = (neq == 0) if (wide or M <= 128) else (e < 5e-2)
+            how = "wide form" if wide else ("32-row blocks" if M <= 128 else "dequant path")
+            print(f"dispatch {name:18} M {M:4} | {how}: differs from the 32-row form in {neq} of {y.numel()}, rel to fp64 {e:.1e}", flush=True)
             if not ok or not np.isfinite(e):
                 fail(f"dispatch {name} M {M}: differs {neq}, rel {e:.1e}")
     # Q5_K's 44-word rows do not fit the wide stages: the launcher must refuse the form, not launch a wrong one

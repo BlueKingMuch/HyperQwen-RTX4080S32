@@ -164,9 +164,9 @@ int32 sums per 32), the A stages 2 × 128 × 256 bytes with 16-byte `cp.async` a
 `ldmatrix` reads, the activation scale prefetched a k-block ahead. Region 9: 96 KB,
 the A stages as the first allocation (Triton's allocator places the largest buffer
 at offset 0) and the weight stages raw-addressed at word 16,384 of the second. Region
-8 is the 64-row form on four warps (64 KB), compiled, not dispatched. Rows 33–128
-stay on the 32-row blocks. A run with a Q4_K, Q5_K or IQ2_S shard keeps the
-dequant path (`GLUON_DEQUANT_TYPES`): Q4_K and IQ2_S run at 0.7 × cuBLAS bf16 in
+8 is the 64-row form on four warps (64 KB), taken from 33 to 64 rows. A run with
+a Q4_K, Q5_K or IQ2_S shard keeps the 32-row blocks to 128 rows and the dequant
+path above (`GLUON_DEQUANT_TYPES`): Q4_K and IQ2_S run at 0.7 × cuBLAS bf16 in
 the wide form, so dequantising and calling cuBLAS is 1.2 × faster for them; Q5_K's
 44-word rows take the wide stages of regions 5–7 and do not fit the wide forms.
 
@@ -226,10 +226,25 @@ cuBLAS bf16 on the dequantised weights takes 3.47–3.55 / 1.99–2.05 / 3.35–
 56.5 ms, 92 TOPS, 0.87× (1.07×), against cuBLAS bf16 49.4 ms and its
 dequantisation 10.9 ms.
 
-Below the chunk the wide form is not the faster launch. One bm-128 launch of
-64 rows runs at a median 0.62–0.82× of the two 32-row blocks over the 41 cells
-(half its rows idle) and at 128 rows at 1.08–1.39× of the four, so the dispatch
-keeps the 32-row blocks to 128 rows and takes the wide form above them.
+Below the chunk the row block is what decides. One bm-128 launch of 64 rows idles
+half its rows, so the dispatch takes bm 64 up to 64 rows and bm 128 above: every
+batch over 32 rows is one M-block and one pass over the weights, where the 32-row
+blocks read them ceil(M / 32) times. At 64 rows — eight streams behind a 7-token
+drafter — that is twice. A C8 torch profile of the step before the change: the
+grouped kernel is 73.4 % of the GPU time at 591 launches per step for about 300
+layer ops, against Marlin's 404 launches for about 384 linears on the W4A16 arm.
+Measuring this on one layer understates it, because a 17,408 × 5,120 tile is 38 MB
+and fits the 64 MB L2, so its second pass comes from cache, where a step streams
+the layers' weights once — 12.5 GB of the 13.1 GB file.
+
+The same C8 workload profiled before and after the change, same card, same curve,
+same profiler: the grouped kernel 3,001.6 → 2,346.2 ms of a 4.09 → 3.43 s GPU-busy
+window (73.4 % → 68.5 %), its launches 31,337 → 21,810 over 53 → 56 steps
+(591 → 389 per step), the split-K sums 48.96 ms over 24,737 launches → 22.03 ms over
+10,521, the profiled rate 338.6 → 395.7 tok/s. `bench/run_benchmarks.sh single`
+after the change, second run, e2e tok/s at T=default and T=0: C1 101.3 / 104.2,
+C2 163.0 / 176.6, C4 274.5 / 301.8, C8 348.3 / 423.2. One stream is 8 rows and
+takes the unchanged path: labd at 100k reads a 72.5 s cold prefill.
 
 What it is worth in the server, on the ByteShape GPU-5 file (`CTX=int4`, the int8
 DFlash2 drafter, `max_num_batched_tokens` 2,048, the same card and probe before
