@@ -22,7 +22,8 @@ bash gguf-plugin/install.sh            # fetch, patch, build, install
 python3 gguf-plugin/test_gguf_rco_cpu.py
 ```
 
-`gguf-plugin/test_gluon_kq_gpu.py` runs on the card (its docstring has the `docker run`).
+`gguf-plugin/test_gluon_kq_gpu.py` and `gguf-plugin/test_gluon_wide_gpu.py` run on the
+card (their docstrings have the `docker run`).
 
 The Dockerfile runs it after `kvarn/install.sh` and `fp8/install.sh`, so every
 image built from this repo has the plugin. It costs build time -- the extension
@@ -149,3 +150,100 @@ types took before; Q4_K the same shape on the grouped kernel):
 | 17,408 × 5,120 | 420.0, 91 | 217.3, 282 | 392.6, 186 | 292.5, 324 |
 | 5,120 × 6,144 | 147.8, 91 | 96.0, 225 | 141.4, 183 | 109.2, 306 |
 | 248,320 × 5,120 | 6,096.6, 90 | 4,153.2, 210 | 5,677.2, 184 | 3,962.6, 341 |
+
+## The wide forms: the chunked prefill's GEMM on the tiles
+
+Above 128 rows a layer's run of tile-type shards goes through the grouped kernel's
+wide form instead of the dequantised tiles and cuBLAS bf16 (`gluon/interface.py`,
+the row-count dispatch): one launch at split 1 (its descriptor table prepared at
+load beside the 1–32-row splits), the grid over the tiles × M-blocks of 128 rows,
+eight warps (the mma's warps [2, 4], the decode layouts replicated over the M
+pair, so every warp decodes its 16 columns once and feeds them to 64 rows of int8
+mma), the activations quantised once per 256 as in the decode (int8, fp32 scale,
+int32 sums per 32), the A stages 2 × 128 × 256 bytes with 16-byte `cp.async` and
+`ldmatrix` reads, the activation scale prefetched a k-block ahead. Region 9: 96 KB,
+the A stages as the first allocation (Triton's allocator places the largest buffer
+at offset 0) and the weight stages raw-addressed at word 16,384 of the second. Region
+8 is the 64-row form on four warps (64 KB), compiled, not dispatched. Rows 33–128
+stay on the 32-row blocks. A run with a Q4_K, Q5_K or IQ2_S shard keeps the
+dequant path (`GLUON_DEQUANT_TYPES`): Q4_K's min term is an outer product per
+sub-block and IQ2_S decodes with two mmas per sub-block, both at 0.7 × cuBLAS
+bf16 in the wide form; Q5_K's 44-word rows take the wide stages of regions 5–7.
+
+The decode launches are unchanged. Their M-block offset is a plain zero and
+folds away; the scale prefetch and the 16-byte swizzle are wide-form branches,
+because carrying them into the decode forms costs 29 registers (a resident block
+at M = 1 and at M = 8) and 4–5 % of the launch. Compiled for sm_89, the decode
+variants keep the registers of the 32-row form above, and their machine code is
+that of the 32-row form except for the row offsets, now int32 rather than int64:
+40 to 64 instructions fewer at bm 16 and bm 32, byte for byte at M = 1.
+
+Registers per wide variant (sm_89, `cuobjdump -res-usage` on a CPU compile of
+the launch; stack bytes in brackets):
+
+| variant | NEW = 0 | Q3_K | Q6_K | Q3_K + Q6_K + Q8_0 |
+|---|---|---|---|---|
+| 64 rows: bm 64, four warps, region 8 | 255 (16) | | | 255 (88) |
+| 128 rows: bm 128, eight warps, region 9 | 255 (24) | 255 (104) | 255 (32) | 255 (96) |
+
+`test_gluon_wide_gpu.py` is the GPU check (the card free, the command in its
+docstring): the ten types at 17,408 × 5,120, 1,024 × 5,120, 1,024 × 17,408 and
+48 × 5,120 (`n_valid` 48), 33 / 64 / 65 / 128 / 129 / 2,048 rows, both wide forms,
+against the 32-row form on the same packed layer: 368 launches, 871,388,192
+elements bit-identical, deterministic, NaN-free; against an fp64 GEMM on
+`gguf.quants.dequantize`'s weights with the kernel's int8 activations max relative
+error 1.5e-6 (the plugin's CUDA fp32 dequantiser is 6.4e-4 off `gguf.quants` on
+Q4_K, exact on the others); a mixed layer of IQ3_S, IQ4_XS and Q6_K shards the same.
+It then runs the op on a layer the loader prepared: at 129 and 300 rows a run of
+wide-form shards leaves the wide launch bit-identical to the 32-row form, a run
+holding a Q4_K shard leaves the dequant path, and a Q5_K layer is refused by the
+launcher instead of being launched into a region its rows do not fit.
+
+Per launch at 2,048 rows (the chunk), `--time`: CUDA-graph replays of ten launches,
+median of nine, the card at its 249.6 W power limit (SW power cap active) — ms,
+TOPS, the ratio of cuBLAS bf16 to the wide form, in brackets the ratio with the
+tiles' dequantisation and the activation quantisation counted:
+
+| type | 17,408 × 5,120 | 10,240 × 5,120 | 5,120 × 17,408 | 6,144 × 5,120 |
+|---|---|---|---|---|
+| IQ4_XS | 2.46 ms, 148 TOPS, 1.42× (1.61×) | 1.40, 153, 1.45× (1.62×) | 2.40, 152, 1.44× (1.53×) | 0.86, 149, 1.46× (1.59×) |
+| IQ3_S | 2.26 ms, 162 TOPS, 1.55× (1.70×) | 1.33, 161, 1.51× (1.65×) | 2.15, 170, 1.57× (1.62×) | 0.76, 170, 1.69× (1.81×) |
+| IQ3_XXS | 2.34 ms, 156 TOPS, 1.49× (1.67×) | 1.33, 162, 1.51× (1.66×) | 2.30, 159, 1.48× (1.55×) | 0.81, 159, 1.56× (1.68×) |
+| IQ2_XXS | 2.58 ms, 141 TOPS, 1.34× (1.48×) | 1.52, 141, 1.31× (1.43×) | 2.54, 144, 1.32× (1.38×) | 0.93, 139, 1.34× (1.44×) |
+| Q8_0 | 3.25 ms, 112 TOPS, 1.07× (4.10×) | 1.39, 154, 1.43× (5.54×) | 3.25, 112, 1.04× (3.91×) | 0.73, 176, 1.74× (6.17×) |
+| Q6_K | 3.70 ms, 99 TOPS, 0.94× (1.10×) | 1.91, 113, 1.04× (1.22×) | 3.68, 99, 0.92× (1.04×) | 1.16, 111, 1.08× (1.23×) |
+| IQ2_XS | 3.60 ms, 101 TOPS, 0.96× (1.07×) | 2.13, 101, 0.93× (1.03×) | 3.53, 103, 0.95× (1.01×) | 1.30, 99, 0.96× (1.04×) |
+| Q3_K | 3.89 ms, 94 TOPS, 0.89× (1.00×) | 2.23, 96, 0.89× (1.00×) | 3.69, 99, 0.91× (0.98×) | 1.36, 95, 0.92× (1.00×) |
+| IQ2_S (dequant path) | 4.98 ms, 73 TOPS, 0.70× (0.78×) | 2.96, 73, 0.68× (0.75×) | 4.95, 74, 0.69× (0.74×) | 1.79, 72, 0.70× (0.76×) |
+| Q4_K (dequant path) | 5.17 ms, 70 TOPS, 0.69× (0.78×) | 2.94, 73, 0.70× (0.79×) | 4.72, 77, 0.71× (0.79×) | 1.77, 73, 0.70× (0.78×) |
+
+cuBLAS bf16 on the dequantised weights takes 3.47–3.55 / 1.99–2.05 / 3.35–3.44 /
+1.24–1.28 ms (101–109 TFLOPS) and cuBLAS int8 on the same shapes 0.94–1.28 /
+0.54–0.70 / 0.88–1.31 / 0.34 ms (279–417 TOPS); the tiles' dequantisation
+0.38–0.64 / 0.22–0.36 / 0.39–0.63 / 0.12–0.20 ms, Q8_0's 10.01 / 5.86 / 10.00 /
+3.41 (the un-repack and the CUDA dequantiser); the activation quantisation
+0.022–0.030 ms, 0.18 at K 17,408. The head, Q6_K 248,320 × 5,120 at 2,048 rows:
+56.5 ms, 92 TOPS, 0.87× (1.07×), against cuBLAS bf16 49.4 ms and its
+dequantisation 10.9 ms.
+
+Below the chunk the wide form is not the faster launch. One bm-128 launch of
+64 rows runs at a median 0.62–0.82× of the two 32-row blocks over the 41 cells
+(half its rows idle) and at 128 rows at 1.08–1.39× of the four, so the dispatch
+keeps the 32-row blocks to 128 rows and takes the wide form above them.
+
+What it is worth in the server, on the ByteShape GPU-5 file (`CTX=int4`, the int8
+DFlash2 drafter, `max_num_batched_tokens` 2,048, the same card and probe before
+and after): a cold 100k prefill 90.4 s → 69.6 s, the cached follow-ups of the same
+document 2.25–2.26 s → 1.81–1.89 s at 8 output tokens and 6.17–6.42 s → 5.64–5.67 s
+at 512 (they recompute one chunk), the KV pool 606,515 → 610,029 tokens (the
+dequantised weight buffer no longer appears in the activation profile). Decode is
+unchanged: labd 100k copy 182.4 → 186.8 tok/s, 4k copy 245.4 → 255.1. Quality:
+GSM8K over 200 questions 0.970 → 0.965, and a passcode hidden at 10 %, 50 % and
+90 % depth of a 100k context is retrieved in all three cases. The file's types make
+this the FFN's gain: IQ4_XS, IQ3_S and IQ3_XXS are 73.5 % of its bytes and all take
+the wide form, against Q4_K 12.7 % and Q5_K 1.6 % on the dequant path.
+
+The first prefill after a cold Triton cache compiles the wide variants the model's
+layers need — twelve for this file — and pays about 45 s for it once; the server
+logs one `tiles_grouped_kernel` JIT warning, and later prefills of the same shape
+run in 1.8–2.1 s. The startup profile run does not reach the wide form.

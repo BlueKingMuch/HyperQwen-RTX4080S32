@@ -41,6 +41,13 @@ or 32 (bm); at 32 every warp issues two mma row blocks per decoded B fragment, s
 stages doubled into a second allocation (regions 3 and 4); the keep-alive sentinel only in region 0; the split
 tables to 32 rows, the budget's row count saturating at 16. At bm 16 the
 launch is byte for byte the 16-row one.
+
+The wide forms (0047): bm 64 (four warps, region 8) and bm 128 (eight warps: the mma's warps [2, 4], the decode
+layouts replicated over the M pair, region 9) over a grid of tiles x M-blocks at split 1 - the chunked prefill's
+GEMM on the tiles (int8 mma from the decoded fragments, 1.4-1.7x the dequantised weights and cuBLAS bf16 on
+IQ4_XS / IQ3_S at 2,048 rows). The A stages take 16-byte cp.async and ldmatrix, the activation scale is prefetched
+a k-block ahead, the row offsets stay int32. Region 9 holds the 64 KB A stages as the first allocation (the
+allocator places the largest buffer at offset 0) and the weight stages raw-addressed at word 16,384 of the second.
 """
 from __future__ import annotations
 
@@ -87,7 +94,8 @@ REGIONS = {0: dict(stage=2304, tab=1792, tabx=1600, aoff=0), 1: dict(stage=2304,
            3: dict(stage=2304, tab=1792, tabx=1600, aoff=0), 4: dict(stage=1792, tab=3584, tabx=3584, aoff=0),
            # the wide stages (2,816 words) for a layer with a Q5_K shard: 5 the [4096] + [2048] region (24 KB, four blocks) as 0,
            # 6 the [8192] region with the A stages at 6144 as 1, 7 the [8192] + [4096] region as 3
-           5: dict(stage=2816, tab=1792, tabx=1600, aoff=0), 6: dict(stage=2816, tab=1792, tabx=1600, aoff=6144), 7: dict(stage=2816, tab=1792, tabx=1600, aoff=0)}
+           5: dict(stage=2816, tab=1792, tabx=1600, aoff=0), 6: dict(stage=2816, tab=1792, tabx=1600, aoff=6144), 7: dict(stage=2816, tab=1792, tabx=1600, aoff=0),
+           8: dict(stage=2304, tab=1792, tabx=1600, aoff=0), 9: dict(stage=2304, tab=1792, tabx=1600, aoff=0)}
 DESC_W = 16            # int32 words per descriptor row
 # the descriptor row
 D_OFF, D_TYPE, D_RW, D_COL0, D_NVALID, D_KB0, D_KB1, D_SPLIT, D_TW = range(9)
@@ -244,8 +252,9 @@ def grouped_split_for(n_tiles: int, nb: int, m: int | None = None, block_bytes: 
 
 def prepare_grouped_layer(tiles_list: list[torch.Tensor], n_outs: list[int], wtypes: list[int], ms=range(1, 33)):
     """The loader's step for a run of tile-type shards: (packed buffer, the shards' tiles as views into it, the
-    descriptor tables of the splits the launch can choose for batches of 1..16 rows, those splits, nb, the
-    layer's bytes per 256 weights). The views replace the separate tile tensors (the prefill path reads them)."""
+    descriptor tables of the splits the launch can choose for batches of 1..32 rows and of split 1 (the wide
+    forms), those splits, nb, the layer's bytes per 256 weights). The views replace the separate tile tensors
+    (the dequant path reads them)."""
     packed, meta = pack_tiles(list(zip(tiles_list, n_outs, wtypes)))
     views = []
     for (base_words, wt, rw, n_out, n_tiles, col0), t in zip(meta["shards"], tiles_list):
@@ -253,7 +262,7 @@ def prepare_grouped_layer(tiles_list: list[torch.Tensor], n_outs: list[int], wty
     nb, n_total = meta["nb"], meta["n_total"]
     n_tiles = sum(-(-n // 64) for n in n_outs)
     block_bytes = int(round(packed.numel() / (n_total * nb)))
-    splits = sorted({grouped_split_for(n_tiles, nb, m=m, block_bytes=block_bytes) for m in ms})
+    splits = sorted({grouped_split_for(n_tiles, nb, m=m, block_bytes=block_bytes) for m in ms} | {1})   # 0047: the wide forms run at split 1
     descs = [descriptors(meta, s, packed.device) for s in splits]
     return packed, views, descs, splits, nb, block_bytes
 
@@ -332,95 +341,120 @@ def _decode_half_iq3s(qsw, qh, sgw, selq, shq, shs, zero4, tbase):
 
 
 @g.jit
-def _run(TP: gl.constexpr, RW: gl.constexpr, NST: gl.constexpr, E: gl.constexpr, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split,
+def _run(TP: gl.constexpr, RW: gl.constexpr, NST: gl.constexpr, E: gl.constexpr, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0,
          XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
          M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk,
          BM: gl.constexpr, BN: gl.constexpr, STAGE_: gl.constexpr, TAB: gl.constexpr,
          K0: gl.constexpr, K1: gl.constexpr, K2: gl.constexpr, K3: gl.constexpr,
-         AMODE: gl.constexpr, STAGES: gl.constexpr, GX: gl.constexpr, REGION: gl.constexpr, TABX: gl.constexpr, AOFF: gl.constexpr):
+         AMODE: gl.constexpr, STAGES: gl.constexpr, GX: gl.constexpr, REGION: gl.constexpr, TABX: gl.constexpr, AOFF: gl.constexpr, NW: gl.constexpr):
     """One CTA's tile of type TP (RW words per row, NST stages per k-block): the k-loop over kb0..kb1 on the
     two-stage pipeline, the decode of TP, the epilogue store into the layer's output columns col0.. (or the
     split's partial)."""
     TW: gl.constexpr = 64 * RW            # the k-block's tile words
+    SOFF: gl.constexpr = 16384 if REGION == 9 else 0   # the weight stages' word offset in the dynamic shared memory (region 9: behind the 64 KB A stages, the larger allocation, which the allocator places first)
     HW: gl.constexpr = TW // NST          # the words of one stage: the tile, or its half (Q6_K, Q8_0)
     RWS: gl.constexpr = RW // NST         # the row stride inside a stage
-    mma: gl.constexpr = NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 4], instr_shape=[16, 8])
+    mma: gl.constexpr = NVMMADistributedLayout(version=[2, 0], warps_per_cta=[NW // 4, 4], instr_shape=[16, 8])
     da8: gl.constexpr = DotOperandLayout(0, mma, 4)
     db8: gl.constexpr = DotOperandLayout(1, mma, 4)
-    Lw: gl.constexpr = DistributedLinearLayout(
-        reg_bases=[[0, 4], [32, 0]],
-        lane_bases=[[0, 1], [0, 2], [1, 0], [2, 0], [4, 0]],
-        warp_bases=[[8, 0], [16, 0]], block_bases=[], shape=[64, 8])
+    if NW == 4:
+        Lw: gl.constexpr = DistributedLinearLayout(
+            reg_bases=[[0, 4], [32, 0]],
+            lane_bases=[[0, 1], [0, 2], [1, 0], [2, 0], [4, 0]],
+            warp_bases=[[8, 0], [16, 0]], block_bases=[], shape=[64, 8])
+        L4: gl.constexpr = DistributedLinearLayout(
+            reg_bases=[[32, 0]],
+            lane_bases=[[0, 1], [0, 2], [1, 0], [2, 0], [4, 0]],
+            warp_bases=[[8, 0], [16, 0]], block_bases=[], shape=[64, 4])
+    else:
+        # eight warps: the mma's warp bit 2 runs along M; the decode layouts replicate over it (both M-warps decode their 16 columns)
+        Lw: gl.constexpr = DistributedLinearLayout(
+            reg_bases=[[0, 4], [32, 0]],
+            lane_bases=[[0, 1], [0, 2], [1, 0], [2, 0], [4, 0]],
+            warp_bases=[[8, 0], [16, 0], [0, 0]], block_bases=[], shape=[64, 8])
+        L4: gl.constexpr = DistributedLinearLayout(
+            reg_bases=[[32, 0]],
+            lane_bases=[[0, 1], [0, 2], [1, 0], [2, 0], [4, 0]],
+            warp_bases=[[8, 0], [16, 0], [0, 0]], block_bases=[], shape=[64, 4])
     Lrow_w: gl.constexpr = SliceLayout(1, Lw)
-    L4: gl.constexpr = DistributedLinearLayout(
-        reg_bases=[[32, 0]],
-        lane_bases=[[0, 1], [0, 2], [1, 0], [2, 0], [4, 0]],
-        warp_bases=[[8, 0], [16, 0]], block_bases=[], shape=[64, 4])
     Lrow4: gl.constexpr = SliceLayout(1, L4)
     Lrow_c: gl.constexpr = SliceLayout(0, mma)
 
     NC: gl.constexpr = 1024 if HW > 2048 else 512
-    cc: gl.constexpr = BlockedLayout([1], [32], [4], [0])
+    cc: gl.constexpr = BlockedLayout([1], [32], [NW], [0])
     ic = gl.arange(0, NC, layout=cc)
-    sb = _smem_base(ic)
+    sb = (_smem_base(ic) + SOFF * 4)
     base = TILES32 + off.to(gl.int64)
     if TP == 21:
-        tl1: gl.constexpr = BlockedLayout([4], [32], [4], [0])
+        tl1: gl.constexpr = BlockedLayout([16 // NW], [32], [NW], [0])
         ti = gl.arange(0, 512, layout=tl1)
-        _sts(_smem_base(ti) + (TAB + ti) * 4, gl.load(GRID_S + ti))
+        _sts((_smem_base(ti) + SOFF * 4) + (TAB + ti) * 4, gl.load(GRID_S + ti))
     if TP == 18 and GX == 1:
-        tlx: gl.constexpr = BlockedLayout([2], [32], [4], [0])
+        tlx: gl.constexpr = BlockedLayout([8 // NW], [32], [NW], [0])
         tix = gl.arange(0, 256, layout=tlx)
-        _sts(_smem_base(tix) + (TABX + tix) * 4, gl.load(GRID_X + tix))
+        _sts((_smem_base(tix) + SOFF * 4) + (TABX + tix) * 4, gl.load(GRID_X + tix))
 
     # the field addresses: per row in the decode's row layout (aw), the accumulator's column layout (ac),
     # the IQ3_S [64, 4] row layout (a4), the Q4_K [64, 8] group gather (a2)
     rwv = gl.arange(0, 64, layout=Lrow_w)
     rcv = gl.arange(0, 64, layout=Lrow_c)
     r4v = gl.arange(0, 64, layout=Lrow4)
-    aw = _smem_base(rwv) + rwv * (RWS * 4)
-    ac = _smem_base(rcv) + rcv * (RWS * 4)
-    a4 = _smem_base(r4v) + r4v * (RWS * 4)
+    aw = (_smem_base(rwv) + SOFF * 4) + rwv * (RWS * 4)
+    ac = (_smem_base(rcv) + SOFF * 4) + rcv * (RWS * 4)
+    a4 = (_smem_base(r4v) + SOFF * 4) + r4v * (RWS * 4)
     r2 = gl.arange(0, 64, layout=SliceLayout(1, Lw))
     c2 = gl.arange(0, 8, layout=SliceLayout(0, Lw))
-    a2 = _smem_base(r2)[:, None] + (r2[:, None] * RWS + 4 + c2[None, :]) * 4
-    a2z = _smem_base(r2)[:, None] + (r2[:, None] * RWS + c2[None, :]) * 4       # the same gather from word 0 (the K-quant / Q8_0 planes)
+    a2 = (_smem_base(r2) + SOFF * 4)[:, None] + (r2[:, None] * RWS + 4 + c2[None, :]) * 4
+    a2z = (_smem_base(r2) + SOFF * 4)[:, None] + (r2[:, None] * RWS + c2[None, :]) * 4       # the same gather from word 0 (the K-quant / Q8_0 planes)
     bidx = gl.arange(0, 8, layout=SliceLayout(0, Lw))
     zero2 = gl.zeros([64, 8], gl.int32, Lw)
     b2 = zero2 + bidx[None, :]
     zero4 = gl.zeros([64, 4], gl.int32, L4)
     b4 = zero4 + gl.arange(0, 4, layout=SliceLayout(0, L4))[None, :]
-    tbase = _smem_base(zero4) + TAB * 4
+    tbase = (_smem_base(zero4) + SOFF * 4) + TAB * 4
     mm = gl.arange(0, BM, layout=SliceLayout(1, da8))
     kx = gl.arange(0, 32, layout=SliceLayout(0, da8))
-    m_ok = mm < M
-    xrow = XQ + mm[:, None] * stride_xq
+    m_ok = mm < M - r0
+    xrow = XQ + (r0 + mm)[:, None] * stride_xq
     ms = gl.arange(0, BM, layout=SliceLayout(1, mma))
-    ms_ok = ms < M
-    sxrow = SX + ms * stride_sx
-    sumrow = SUMX + ms * stride_sum
+    ms_ok = ms < M - r0
+    sxrow = SX + (r0 + ms) * stride_sx
+    sumrow = SUMX + (r0 + ms) * stride_sum
 
-    tbx = _smem_base(zero2) + TABX * 4
+    tbx = (_smem_base(zero2) + SOFF * 4) + TABX * 4
     if AMODE == 2:
-        # the activation tile of a k-block: BM rows x 64 words, 4-byte cp.async coalesced along the row (16 lanes
-        # x 4 B per row, two rows per warp), rows >= M masked; two stages after the weight stages in the region
-        smem_a_words: gl.constexpr = SwizzledSharedLayout(1, 1, 8, [1, 0])
-        smem_a8: gl.constexpr = SwizzledSharedLayout(4, 1, 8, [1, 0])
-        cpa: gl.constexpr = BlockedLayout([1, 1], [2, 16], [4, 1], [1, 0])
+        # the activation tile of a k-block: BM rows x 64 words, cp.async coalesced along the row (16 lanes,
+        # two rows per warp), rows >= M masked; two stages beside the weight stages in the region
+        if BM >= 64:
+            # the wide forms read the stage with ldmatrix, so the tile is swizzled for 16-byte vectors and the
+            # copy moves 16 B per lane; the same layout costs the decode forms 4-5 % (0046's 4-byte copy stands)
+            smem_a_words: gl.constexpr = SwizzledSharedLayout(4, 1, 8, [1, 0])
+            smem_a8: gl.constexpr = SwizzledSharedLayout(16, 1, 8, [1, 0])
+            cpa: gl.constexpr = BlockedLayout([1, 4], [2, 16], [NW, 1], [1, 0])
+        else:
+            smem_a_words: gl.constexpr = SwizzledSharedLayout(1, 1, 8, [1, 0])
+            smem_a8: gl.constexpr = SwizzledSharedLayout(4, 1, 8, [1, 0])
+            cpa: gl.constexpr = BlockedLayout([1, 1], [2, 16], [NW, 1], [1, 0])
         am = gl.arange(0, BM, layout=SliceLayout(1, cpa))
         aw_ = gl.arange(0, 64, layout=SliceLayout(0, cpa))
         XQ32 = XQ.to(gl.pointer_type(gl.int32), bitcast=True)
-        arow = am.to(gl.int64) * (stride_xq // 4)
-        amask = (am < M)[:, None] & (aw_ < 64)[None, :]
+        arow = (r0 + am) * (stride_xq // 4)
+        amask = (am < M - r0)[:, None] & (aw_ < 64)[None, :]
         if REGION == 1:
             smem_a = smem.slice(AOFF, 2048)._reinterpret(gl.int32, [2, BM, 64], smem_a_words)
         elif REGION == 6:
             smem_a = smem.slice(AOFF, 2048)._reinterpret(gl.int32, [2, BM, 64], smem_a_words)
+        elif REGION == 9:
+            smem_a = smem._reinterpret(gl.int32, [2, BM, 64], smem_a_words)
         else:
             smem_a = smem2._reinterpret(gl.int32, [2, BM, 64], smem_a_words)
 
     acc = gl.zeros([BM, BN], gl.float32, mma)
     ntiles = kb1 - kb0
+    if E == 1 and BM >= 64:
+        # the wide forms read the k-block's activation scale one k-block ahead; in the decode forms the same
+        # prefetch costs 29 registers (a resident block at M = 1 and M = 8), so they keep the load in place
+        sx_n = gl.load(sxrow + kb0, mask=ms_ok, other=0.0)
     _copy_stage(sb, 0, base + kb0 * TW, ic, HW, STAGE_)
     if AMODE == 2:
         async_copy.async_copy_global_to_shared(smem_a.index(0), XQ32 + arow[:, None] + (kb0 * 64 + aw_)[None, :], amask)
@@ -474,7 +508,11 @@ def _run(TP: gl.constexpr, RW: gl.constexpr, NST: gl.constexpr, E: gl.constexpr,
                 if AMODE == 2:
                     a_tile = smem_a.index(it % 2)._reinterpret(gl.int8, [BM, 256], smem_a8)
                 if E == 1:
-                    sx = gl.load(sxrow + kb, mask=ms_ok, other=0.0)                       # the activation scale per 256
+                    if BM >= 64:
+                        sx = sx_n                                                         # the activation scale per 256, prefetched
+                        sx_n = gl.load(sxrow + kb + 1, mask=ms_ok & (kb + 1 < kb1), other=0.0)
+                    else:
+                        sx = gl.load(sxrow + kb, mask=ms_ok, other=0.0)                    # the activation scale per 256
                     acc_k = gl.zeros([BM, BN], gl.int32, mma)
             if TP == 21:
                 # IQ3_S: qs words 0-15, qh 16-17, signs 18-25, scales 26, d 27 (the 0036 tile row)
@@ -1038,8 +1076,11 @@ def _run(TP: gl.constexpr, RW: gl.constexpr, NST: gl.constexpr, E: gl.constexpr,
             gl.barrier()
     ym = gl.arange(0, BM, layout=SliceLayout(1, mma))
     yn = gl.arange(0, BN, layout=SliceLayout(0, mma))
-    omask = (ym[:, None] < M) & (yn[None, :] < n_valid)
-    keep = smem.slice(0, 64).load(SliceLayout(0, mma))
+    omask = (ym[:, None] < M - r0) & (yn[None, :] < n_valid)
+    if REGION == 9:   # the weight stages live in the second allocation here (kept by this load; the A stages have visible uses)
+        keep = smem2.slice(0, 64).load(SliceLayout(0, mma))
+    else:
+        keep = smem.slice(0, 64).load(SliceLayout(0, mma))
     omask = omask & (keep[None, :] != 0x7FFFFFFF)
     if REGION == 0:   # 0046: only region 0's second allocation is otherwise untouched (regions 3 and 4 hold the A stages)
         keep2 = smem2.slice(0, 64).load(SliceLayout(0, mma))
@@ -1048,17 +1089,24 @@ def _run(TP: gl.constexpr, RW: gl.constexpr, NST: gl.constexpr, E: gl.constexpr,
         keep2 = smem2.slice(0, 64).load(SliceLayout(0, mma))
         omask = omask & (keep2[None, :] != 0x7FFFFFFF)
     Yp = Y + split.to(gl.int64) * stride_yk
-    gl.store(Yp + ym[:, None] * stride_ym + (col0 + yn)[None, :], acc.to(Y.dtype.element_ty), mask=omask)
+    gl.store(Yp + (r0 + ym)[:, None] * stride_ym + (col0 + yn)[None, :], acc.to(Y.dtype.element_ty), mask=omask)
 
 
 @g.jit
 def tiles_grouped_kernel(XQ, SX, SUMX, TILES, DESC, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
                          M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk,
-                         BM: gl.constexpr, BN: gl.constexpr, STAGE_: gl.constexpr, TAB: gl.constexpr, E: gl.constexpr, NEW: gl.constexpr,
+                         BM: gl.constexpr, BN: gl.constexpr, STAGE_: gl.constexpr, TAB: gl.constexpr, E: gl.constexpr, NEW: gl.constexpr, NW: gl.constexpr,
                          K0: gl.constexpr, K1: gl.constexpr, K2: gl.constexpr, K3: gl.constexpr,
                          AMODE: gl.constexpr, STAGES: gl.constexpr, GX: gl.constexpr, REGION: gl.constexpr, TABX: gl.constexpr, AOFF: gl.constexpr):
     smem_flat: gl.constexpr = SwizzledSharedLayout(4, 1, 1, [0])
     pid = gl.program_id(0)
+    if BM >= 64:
+        # the wide forms: the rows of this CTA's M-block, added to the row of every load and of the store
+        # (int32 throughout: M x max(K, n_total) < 2^31, asserted in the launcher). As a plain zero in the
+        # decode forms it folds away, and they compile to the launches of 0046 to the register
+        r0 = gl.program_id(1) * BM
+    else:
+        r0 = 0
     drow = DESC + pid * 16
     off = gl.load(drow + 0)
     tp = gl.load(drow + 1)
@@ -1093,6 +1141,15 @@ def tiles_grouped_kernel(XQ, SX, SUMX, TILES, DESC, Y, GRID_S, GRID_X, GRID2_XXS
         # the wide stages at 0 / 2816, the A stages at 6144, one [8192] region
         smem = gl.allocate_shared_memory(gl.int32, [8192], smem_flat)
         smem2 = smem
+    elif REGION == 8:
+        # the 64-row wide form: stages at 0 / 2304 in the first allocation, the 64-row A stages (2 x 64 x 64 words) in the second
+        smem = gl.allocate_shared_memory(gl.int32, [8192], smem_flat)
+        smem2 = gl.allocate_shared_memory(gl.int32, [8192], smem_flat)
+    elif REGION == 9:
+        # the 128-row wide form (eight warps): the 128-row A stages (2 x 128 x 64 words, 64 KB) as the first allocation
+        # (the allocator places the largest buffer at offset 0), the weight stages raw-addressed at word 16384 in the second
+        smem = gl.allocate_shared_memory(gl.int32, [16384], smem_flat)
+        smem2 = gl.allocate_shared_memory(gl.int32, [8192], smem_flat)
     elif REGION == 7:
         # the wide stages at 0 / 2816, the 32-row A stages in the second allocation
         smem = gl.allocate_shared_memory(gl.int32, [8192], smem_flat)
@@ -1103,45 +1160,45 @@ def tiles_grouped_kernel(XQ, SX, SUMX, TILES, DESC, Y, GRID_S, GRID_X, GRID2_XXS
     TILES32 = TILES.to(gl.pointer_type(gl.int32), bitcast=True)
     # the type is uniform per CTA: one branch, one compiled decode with its row words
     if tp == 21:
-        _run(21, 28, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+        _run(21, 28, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 23:
-        _run(23, 34, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+        _run(23, 34, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 12:
-        _run(12, 36, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+        _run(12, 36, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 18:
-        _run(18, 25, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+        _run(18, 25, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 16:
-        _run(16, 17, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+        _run(16, 17, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 17:
-        _run(17, 19, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+        _run(17, 19, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 22:
-        _run(22, 21, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+        _run(22, 21, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+             M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     # the K-quant / Q8_0 types (kq_tiles.py): members of the same chain, each compiled only when the launch's NEW mask names its
     # type (a layer without them compiles to the seven-type kernel; as separate ifs after the chain they cost the M = 1
     # variant 29 registers, 126 -> 155)
     elif tp == 8:
         if NEW & 1:
-            _run(8, 68, 2, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+            _run(8, 68, 2, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 11:
         if NEW & 2:
-            _run(11, 28, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+            _run(11, 28, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 13:
         if NEW & 4:
-            _run(13, 44, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+            _run(13, 44, 1, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
     elif tp == 14:
         if NEW & 8:
-            _run(14, 54, 2, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
-                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF)
+            _run(14, 54, 2, E, smem, smem2, TILES32, off, kb0, kb1, col0, n_valid, split, r0, XQ, SX, SUMX, Y, GRID_S, GRID_X, GRID2_XXS, GRID2_XS, GRID2_S,
+                 M, stride_xq, stride_sx, stride_sum, stride_ym, stride_yk, BM, BN, STAGE_, TAB, K0, K1, K2, K3, AMODE, STAGES, GX, REGION, TABX, AOFF, NW)
 
 
 def grouped_gemm(packed: torch.Tensor, meta, X: torch.Tensor, splitk: int | None = None, num_warps: int = 4,
@@ -1154,11 +1211,13 @@ def grouped_gemm(packed: torch.Tensor, meta, X: torch.Tensor, splitk: int | None
     assert X.is_cuda and X.dtype == torch.bfloat16 and X.dim() == 2
     M, K = X.shape
     nb = K // 256
-    assert K % 256 == 0 and nb == meta["nb"] and M <= 32
+    assert K % 256 == 0 and nb == meta["nb"] and (M <= 32 or bm in (64, 128))
     if bm is None:
         bm = 16 if M <= 16 else 32          # 0046: one launch of two mma row blocks above 16 rows
-    assert bm in (16, 32) and M <= bm
+    assert bm in (16, 32, 64, 128) and (M <= bm or (splitk in (None, 1) and bm >= 32))
+    n_mblocks = -(-M // bm)
     n_total = meta["n_total"]
+    assert M * max(K, n_total) < 2 ** 31, (M, K, n_total)   # the row offsets stay int32 (the chunk's rows: 2,048 x 34,816)
     if quantized is not None and len(quantized) == 3:
         XQ, SX, SUMX = quantized
         assert SX.shape[1] == (nb if e else 8 * nb), "quantized does not match e"
@@ -1193,18 +1252,22 @@ def grouped_gemm(packed: torch.Tensor, meta, X: torch.Tensor, splitk: int | None
     region = 2 if compact else (1 if (amode == 2 or stages == 3) else 0)
     if bm == 32 and amode == 2:
         region = 4 if max_rw <= 28 else 3     # 0046: the doubled A stages need the second allocation
-    assert not (bm == 32 and amode == 2) or region in (3, 4), (bm, amode, region)
+    if bm in (64, 128):
+        assert amode == 2 and max_rw <= 36 and n_mblocks >= 1
+        region = 8 if bm == 64 else 9
+        num_warps = 4 if bm == 64 else 8
+    assert not (bm == 32 and amode == 2) or region in (3, 4, 8), (bm, amode, region)
     assert not (new and stages == 3), "the half-staged types run on the two-stage pipeline"
     if max_rw > 36:
         # a Q5_K shard: the 2,816-word stages in the shapes of regions 0 / 1 / 3 (5 / 6 / 7)
         assert max_rw <= STAGE_WIDE // 64 and region in (0, 1, 3), (max_rw, region)
         region = {0: 5, 1: 6, 3: 7}[region]
     R = REGIONS[region]
-    tiles_grouped_kernel[(desc.shape[0],)](
+    tiles_grouped_kernel[(desc.shape[0], n_mblocks)](
         XQ, SX, SUMX, packed, desc, Y, grid32_iq3s(dev), grid32_iq3xxs(dev),
         grid_words(GGML_TYPE_IQ2_XXS, dev), grid_words(GGML_TYPE_IQ2_XS, dev), grid_words(GGML_TYPE_IQ2_S, dev),
         M, XQ.stride(0), SX.stride(0), SUMX.stride(0), stride_ym, stride_yk,
-        BM=bm, BN=64, STAGE_=R["stage"], TAB=R["tab"], E=int(e), NEW=new, K0=T0, K1=T1, K2=T2, K3=T3,
+        BM=bm, BN=64, STAGE_=R["stage"], TAB=R["tab"], E=int(e), NEW=new, NW=num_warps, K0=T0, K1=T1, K2=T2, K3=T3,
         AMODE=amode, STAGES=stages, GX=int(gx), REGION=region, TABX=R["tabx"], AOFF=R["aoff"], num_warps=num_warps,
         **({"maxnreg": maxnreg} if maxnreg else {}))
     if splitk == 1:

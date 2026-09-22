@@ -397,7 +397,28 @@ def check_bridge() -> None:
     if _p46[3] != sorted({tiles_grouped.grouped_split_for(3, 3, m=m, block_bytes=_p46[5]) for m in range(1, 33)}) or any(
             tiles_grouped.grouped_split_for(3, 3, m=m, block_bytes=_p46[5]) != tiles_grouped.grouped_split_for(3, 3, m=16, block_bytes=_p46[5]) for m in (17, 24, 32)):
         fail("the split tables to 32 rows, the 16-row split above 16 (0046)")
-    print("gluon (0024 + 0025 + 0028 + 0030 + 0031 + 0032 + 0033 + 0034 + 0035 + 0036 + 0037 + 0038 + 0039 + 0040 + 0041 + 0042 + 0043 + 0044 + 0046 + kq): the decode kernels of all eight matmul types of the IQ3_S file are installed and dispatched at up to 16 rows (32 on row halves); every type but Q2_K tile-major only and through the grouped kernel (one op, one launch per layer; per-256 activations on every type), Q3_K / Q5_K / Q6_K / Q8_0 tile-major through the same kernel; the split-K from the measured tables, capped per batch")
+    # 0047: the wide forms - bm 64 (four warps, region 8) and bm 128 (eight warps, region 9: the 64 KB A stages as the first
+    # allocation, the weight stages raw-addressed at word 16384 of the second), the grid over M-blocks, split 1 in every
+    # layer's tables, the dispatch above 128 rows for runs without a min type. The scale prefetch and the A stages' 16-byte
+    # swizzle are wide-form branches (in the decode forms they cost 29 registers and 4-5 %), so both guards are pinned here.
+    _src47 = _inspect.getsource(tiles_grouped.grouped_gemm)
+    _gi47 = _inspect.getsource(gi.gluon_mul_mat_tiles_grouped)
+    if (
+        tiles_grouped.REGIONS.get(8, {}).get("stage") != 2304 or tiles_grouped.REGIONS.get(9, {}).get("stage") != 2304
+        or "elif REGION == 8:" not in _txt46 or "elif REGION == 9:" not in _txt46
+        or "SOFF: gl.constexpr = 16384 if REGION == 9 else 0" not in _txt46 or "(_smem_base(ic) + SOFF * 4)" not in _txt46
+        or "warps_per_cta=[NW // 4, 4]" not in _txt46 or "warp_bases=[[8, 0], [16, 0], [0, 0]]" not in _txt46
+        or "r0 = gl.program_id(1) * BM" not in _txt46 or "SwizzledSharedLayout(16, 1, 8, [1, 0])" not in _txt46
+        or "sx_n = gl.load(sxrow + kb + 1, mask=ms_ok & (kb + 1 < kb1), other=0.0)" not in _txt46
+        or "if E == 1 and BM >= 64:" not in _txt46
+        or "cpa: gl.constexpr = BlockedLayout([1, 1], [2, 16], [NW, 1], [1, 0])" not in _txt46
+        or "tiles_grouped_kernel[(desc.shape[0], n_mblocks)](" not in _src47 or "region = 8 if bm == 64 else 9" not in _src47
+        or "num_warps = 4 if bm == 64 else 8" not in _src47 or "| {1})" not in _txt46
+        or gi.GLUON_DEQUANT_TYPES != frozenset({12, 13, 22}) or "bm=128)" not in _gi47 or "\"desc\": {1: descs[desc_splits.index(1)]}" not in _gi47
+        or "set(weight_types) & GLUON_DEQUANT_TYPES" not in _gi47 or 1 not in _p46[3]
+    ):
+        fail("the wide forms (0047)")
+    print("gluon (0024 + 0025 + 0028 + 0030 + 0031 + 0032 + 0033 + 0034 + 0035 + 0036 + 0037 + 0038 + 0039 + 0040 + 0041 + 0042 + 0043 + 0044 + 0046 + 0047 + kq): the decode kernels of all eight matmul types of the IQ3_S file are installed and dispatched at up to 16 rows (32 on row halves); every type but Q2_K tile-major only and through the grouped kernel (one op, one launch per layer; per-256 activations on every type), Q3_K / Q5_K / Q6_K / Q8_0 tile-major through the same kernel; the split-K from the measured tables, capped per batch; above 128 rows the wide form (128-row M-blocks, eight warps) for runs without Q4_K / Q5_K / IQ2_S")
 
 
 def main() -> int:

@@ -157,7 +157,7 @@ def check_type(wt, n_out, K, dev, rng, rows_model=None):
             wide = torch.empty((M, n_out + 64), dtype=torch.bfloat16, device=dev)
             xq32 = quantize_activations(X.contiguous(), with_sums=True)
             tiles.tiles_gemm(t, X, n_out, wt, quantized=xq32, out=wide[:, 64:])
-            y0, _, _ = launch(packed, meta, X, n_tiles, nb, block_bytes, False, out_dtype=torch.bfloat16)
+            y0, _, _ = launch(packed, meta, X, n_tiles, nb, block_bytes, False, out_dtype=torch.bfloat16, splitk=tg.grouped_split_for(n_tiles, nb, m=M))   # the registry's split (no block_bytes cap): the same summation order
             if not torch.equal(wide[:, 64:], y0):
                 fail(f"{name} [{n_out}x{K}] tiles_gemm into a column view differs from the grouped launch")
             for s in sorted(set(splits) | {1, 2, 3, 5, min(8, nb)}):
@@ -253,6 +253,7 @@ def main():
     ap.add_argument("--shapes", default="")
     a = ap.parse_args()
     dev = torch.device("cuda")
+    torch.manual_seed(7)
     torch.cuda.init()
     print(torch.cuda.get_device_name(), "| triton", __import__("triton").__version__, flush=True)
     types = [int(x) for x in a.types.split(",")]
