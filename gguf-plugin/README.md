@@ -153,12 +153,14 @@ types took before; Q4_K the same shape on the grouped kernel):
 
 ## The wide forms: the chunked prefill's GEMM on the tiles
 
-Above 128 rows a layer's run of tile-type shards goes through the grouped kernel's
-wide form instead of the dequantised tiles and cuBLAS bf16 (`gluon/interface.py`,
-the row-count dispatch): one launch at split 1 (its descriptor table prepared at
-load beside the 1–32-row splits), the grid over the tiles × M-blocks of 128 rows,
-eight warps (the mma's warps [2, 4], the decode layouts replicated over the M
-pair, so every warp decodes its 16 columns once and feeds them to 64 rows of int8
+Above 32 rows a layer's run of tile-type shards goes through the grouped kernel's
+wide forms — to 128 rows in place of the 32-row blocks, above them in place of the
+dequantised tiles and cuBLAS bf16 (`gluon/interface.py`, the row-count dispatch):
+one launch at split 1 (its descriptor table prepared at load beside the 1–32-row
+splits), the grid over the tiles × M-blocks of 128 rows (one M-block to 128 rows,
+ceil(M / 128) above it — sixteen for the 2,048-row chunk), eight warps (the mma's
+warps [2, 4], the decode layouts replicated over the M pair, so every warp decodes
+its 16 columns once and feeds them to 64 rows of int8
 mma), the activations quantised once per 256 as in the decode (int8, fp32 scale,
 int32 sums per 32), the A stages 2 × 128 × 256 bytes with 16-byte `cp.async` and
 `ldmatrix` reads, the activation scale prefetched a k-block ahead. Region 9: 96 KB,
@@ -227,12 +229,16 @@ cuBLAS bf16 on the dequantised weights takes 3.47–3.55 / 1.99–2.05 / 3.35–
 dequantisation 10.9 ms.
 
 Below the chunk the row block is what decides. One bm-128 launch of 64 rows idles
-half its rows, so the dispatch takes bm 64 up to 64 rows and bm 128 above: every
-batch over 32 rows is one M-block and one pass over the weights, where the 32-row
-blocks read them ceil(M / 32) times. At 64 rows — eight streams behind a 7-token
-drafter — that is twice. A C8 torch profile of the step before the change: the
-grouped kernel is 73.4 % of the GPU time at 591 launches per step for about 300
-layer ops, against Marlin's 404 launches for about 384 linears on the W4A16 arm.
+half its rows, so the dispatch takes bm 64 up to 64 rows and bm 128 above: a batch
+to 128 rows is one M-block and one pass over the weights, where the 32-row blocks
+read them ceil(M / 32) times, and above 128 rows it is ceil(M / 128) passes. At 64
+rows — eight streams behind a 7-token drafter — that is one against two. The wide
+launch also runs at split 1 where a 32-row block ran at its table split, so the
+fp32 partial sum the split needed is gone: in the profile below the sum kernel
+drops from 467 launches per step to 188. A C8 torch profile of the step before the
+change: the grouped kernel is 73.4 % of the GPU time at 591 launches per step for
+about 300 layer ops, against Marlin's 404 launches for about 384 linears on the
+W4A16 arm.
 Measuring this on one layer understates it, because a 17,408 × 5,120 tile is 38 MB
 and fits the 64 MB L2, so its second pass comes from cache, where a step streams
 the layers' weights once — 12.5 GB of the 13.1 GB file.
