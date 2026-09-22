@@ -399,7 +399,7 @@ def check_bridge() -> None:
         fail("the split tables to 32 rows, the 16-row split above 16 (0046)")
     # 0047: the wide forms - bm 64 (four warps, region 8) and bm 128 (eight warps, region 9: the 64 KB A stages as the first
     # allocation, the weight stages raw-addressed at word 16384 of the second), the grid over M-blocks, split 1 in every
-    # layer's tables, the dispatch above 128 rows for runs without a min type. The scale prefetch and the A stages' 16-byte
+    # layer's tables, the dispatch above 32 rows for runs without a min type (bm 64 to 64 rows, bm 128 above). The scale prefetch and the A stages' 16-byte
     # swizzle are wide-form branches (in the decode forms they cost 29 registers and 4-5 %), so both guards are pinned here.
     _src47 = _inspect.getsource(tiles_grouped.grouped_gemm)
     _gi47 = _inspect.getsource(gi.gluon_mul_mat_tiles_grouped)
@@ -419,7 +419,7 @@ def check_bridge() -> None:
         or "set(weight_types) & GLUON_DEQUANT_TYPES" not in _gi47 or 1 not in _p46[3]
     ):
         fail("the wide forms (0047)")
-    print("gluon (0024 + 0025 + 0028 + 0030 + 0031 + 0032 + 0033 + 0034 + 0035 + 0036 + 0037 + 0038 + 0039 + 0040 + 0041 + 0042 + 0043 + 0044 + 0046 + 0047 + 0050 + kq): the decode kernels of all eight matmul types of the IQ3_S file are installed and dispatched at up to 16 rows (32 on row halves); every type but Q2_K tile-major only and through the grouped kernel (one op, one launch per layer; per-256 activations on every type), Q3_K / Q5_K / Q6_K / Q8_0 tile-major through the same kernel; the split-K from the measured tables, capped per batch; above 128 rows the wide form (128-row M-blocks, eight warps) for runs without Q4_K / Q5_K / IQ2_S, from 33 rows at bm 64")
+    print("gluon (0024 + 0025 + 0028 + 0030 + 0031 + 0032 + 0033 + 0034 + 0035 + 0036 + 0037 + 0038 + 0039 + 0040 + 0041 + 0042 + 0043 + 0044 + 0046 + 0047 + 0050 + kq): the decode kernels of all eight matmul types of the IQ3_S file are installed and dispatched at up to 16 rows (32 on row halves); every type but Q2_K tile-major only and through the grouped kernel (one op, one launch per layer; per-256 activations on every type), Q3_K / Q5_K / Q6_K / Q8_0 tile-major through the same kernel; the split-K from the measured tables, capped per batch; above 32 rows the wide form for runs without Q4_K / Q5_K / IQ2_S, bm 64 on four warps from 33 to 64 rows and bm 128 on eight warps above, one M-block to 128 rows and ceil(M / 128) above")
 
 
 def main() -> int:

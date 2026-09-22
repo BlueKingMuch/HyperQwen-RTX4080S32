@@ -66,7 +66,7 @@ GLUON_TYPES = frozenset(_KERNELS)
 GLUON_INT8_TYPES = frozenset(_INT8_KERNELS)
 GLUON_MAX_ROWS = 16
 GLUON_MAX_ROWS_GROUPED = 32   # 0046: the grouped kernel's one launch (bm 16 up to 16 rows, bm 32 above)
-GLUON_ARRIVAL_ROWS = 128      # 0046: above one launch, 32-row blocks on the grouped kernel up to here
+GLUON_ARRIVAL_ROWS = 128      # 0046, 0050: a run with a GLUON_DEQUANT_TYPES shard, 32-row blocks on the grouped kernel up to here
 GLUON_DEQUANT_TYPES = frozenset({12, 13, 22})   # 0047: a run with one of these keeps the dequant path above 128 rows - Q4_K (0.77-0.82x of dequant + cuBLAS bf16 at 2,048 rows) and IQ2_S (0.73-0.79x) are slower in the wide form, Q5_K's 44-word rows do not fit it
 GLUON_TILE_TYPES = frozenset(TILE_TYPES)     # 0038: the types the loader holds tile-major (every int8 type)
 
@@ -148,8 +148,9 @@ def gluon_mul_mat_tiles_grouped(x: torch.Tensor, packed: torch.Tensor, descs: li
     for that row count (precomputed at load for 1..32 rows: a split outside the tables would build one inside the
     compiled graph), the type uniform per CTA selecting the compiled decode, every tile writing its own columns,
     the partials summed in one fp32 kernel. Above 32 rows the wide form (0047, 0050): one launch at split 1,
-    bm 64 up to 64 rows and bm 128 above, so the weights are streamed once for the whole batch instead of
-    ceil(M / 32) times - at 64 rows, the eight streams of a 7-token drafter, that is twice. Unless the run has
+    bm 64 up to 64 rows and bm 128 above, so the weights are streamed ceil(M / bm) times instead of
+    ceil(M / 32) - one pass to 128 rows, so at 64 rows (the eight streams of a 7-token drafter) one against two,
+    and sixteen against sixty-four for the 2,048-row chunk. Unless the run has
     a shard of GLUON_DEQUANT_TYPES: those keep the 32-row blocks to 128 rows and the dequant path above (the
     dequantised tiles and cuBLAS, into the slice). The row-count dispatch lives here, inside the op (lesson 7b)."""
     M, K = int(x.shape[0]), int(x.shape[1])
@@ -157,7 +158,9 @@ def gluon_mul_mat_tiles_grouped(x: torch.Tensor, packed: torch.Tensor, descs: li
     out = torch.empty((M, n_total), dtype=x.dtype, device=x.device)
     if M > GLUON_MAX_ROWS_GROUPED and not (set(weight_types) & GLUON_DEQUANT_TYPES):
         # 0050: one wide launch for the whole batch. A C8 verify step is 64 rows and read the weights twice as
-        # 32-row blocks; one bm-64 launch reads them once. bm 128 above 64 rows keeps it at one M-block.
+        # 32-row blocks; one bm-64 launch reads them once. bm 128 above 64 rows: one M-block to 128 rows,
+        # ceil(M / 128) above it (sixteen for the 2,048-row chunk). The wide launch runs at split 1 where a
+        # 32-row block ran at its table split, so the fp32 partial sum the split needed is gone.
         xq = quantize_activations_256(x.contiguous(), with_sums=True)
         meta = {"nb": nb, "n_total": n_total, "desc": {1: descs[desc_splits.index(1)]}, "types": weight_types,
                 "max_rw": max(STAGE_ROW_WORDS[wt] for wt in weight_types)}
