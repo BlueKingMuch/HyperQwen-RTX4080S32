@@ -4,7 +4,7 @@ set -euo pipefail
 # Fetch the out-of-tree GGUF plugin at a pinned commit, patch it, and build its
 # extension for this card. Nothing of the plugin's source lives in this repo:
 # the archive is fetched and its sha256 checked, so what is carried here is only
-# what is ours -- the ten patches, the Gluon decode kernels, and the CPU gate.
+# what is ours -- the eleven patches, the Gluon decode kernels, and the CPU gate.
 #
 # The same shape as kvarn/install.sh, run after the vLLM series rather than
 # beside it, because the plugin is installed as a package and not patched into
@@ -17,7 +17,7 @@ set -euo pipefail
 #
 #   SHA256SUMS         what this repo carries is what was reviewed
 #   the archive        upstream's bytes at PIN are the bytes that were patched
-#   before / after     the six files the patches touch entered and left in the
+#   before / after     the files the patches touch entered and left in the
 #                      exact states the series was cut for -- a patch that lands
 #                      somewhere plausible but wrong fails here, not in a kernel
 #
@@ -50,7 +50,9 @@ ARCHIVE_SHA=c225ff0a282e9703b924084a5b9af3a834e5882ad733ffee64027f6f1b3a755c
 : "${TORCH_CUDA_ARCH_LIST:=8.9;12.0}"
 : "${MAX_JOBS:=8}"
 
-# The six files the series touches, before it runs and after.
+# The files the series touches, before it runs and after. The four added by
+# gguf-dflash2-draft-gguf.patch have no BEFORE entry: params.py, config.py
+# and weights_adapter/__init__.py are only edited by it, and dflash.py is new.
 BEFORE="8c80ecb5fadecf60c603274ceeb3cd84500a8c6f915ea52b86d307e4775f2b2f  vllm_gguf_plugin/loader.py
 a49b946f6374aa12a14a6517cd2f0140271818e59881a87f0238024b211f7984  vllm_gguf_plugin/config_parser.py
 f46667f8c09a7ca8b90fd4b7c89a5eca54cca99372762c3c2853870874d6e829  vllm_gguf_plugin/csrc/gguf/mmvq.cuh
@@ -58,12 +60,16 @@ f46667f8c09a7ca8b90fd4b7c89a5eca54cca99372762c3c2853870874d6e829  vllm_gguf_plug
 990b6aca44615eaf39a3fa76b65992e1101cf1c4d27ec3a36070074f9f83136b  vllm_gguf_plugin/csrc/gguf/ggml-common.h
 b40556bc026632e610adaee2855d42ddc3d00d99ba07fdfee7cae171ec180efe  vllm_gguf_plugin/quantization/linear.py"
 
-AFTER="c29496bbc68cd8a029ca887ba5618dba81ad46ba69e67c355098d4869de38b01  vllm_gguf_plugin/loader.py
+AFTER="be71ead0f5c8539b89bba8ff7eb186c40a583ca29b96619c67af71241f631408  vllm_gguf_plugin/loader.py
 bb4ed268b66f58393d0872a27dd07d00e40b7e9e6ae4b1213fcfe1c8fffa9e49  vllm_gguf_plugin/config_parser.py
 62c48aecab78a5ef724441696f9f849e4a20e25ac1e2ae5c3f773b835f36964b  vllm_gguf_plugin/csrc/gguf/mmvq.cuh
 77ce6a702daf92e78983d2e0f73d1908a689aaa0a0673ef835a234bbe9a5f7d4  vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu
 e075e3e7bc0c195d7ffef2c765b0f811da8cbd04906bb2572c272decb2b20bbc  vllm_gguf_plugin/csrc/gguf/ggml-common.h
-b3f7daf879cd486fb12382cd5b377104f488066b39fc0a0b4783657f486b8bc1  vllm_gguf_plugin/quantization/linear.py"
+b3f7daf879cd486fb12382cd5b377104f488066b39fc0a0b4783657f486b8bc1  vllm_gguf_plugin/quantization/linear.py
+73554097ab1f1efb053d5b668b8568befbc079cf512902e1cd0b7a782d762304  vllm_gguf_plugin/quantization/params.py
+909da463f281bb0c39ebbbba89719562356ebb9d0efc046c8e0f6959cc0d28c1  vllm_gguf_plugin/quantization/config.py
+5cdacfd6b2144f06d60faafe7ce0e67ae875cbf38b8300aefeb6507922abe44d  vllm_gguf_plugin/weights_adapter/__init__.py
+d7ea8f323420ca3679d2c9c1d2badeda51f0b13f0a3fad891e99e29157a83fcb  vllm_gguf_plugin/weights_adapter/dflash.py"
 
 say() { printf '== %s\n' "$*"; }
 

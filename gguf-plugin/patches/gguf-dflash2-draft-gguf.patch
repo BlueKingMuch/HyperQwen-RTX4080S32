@@ -1,0 +1,321 @@
+--- a/vllm_gguf_plugin/loader.py
++++ b/vllm_gguf_plugin/loader.py
+@@ -242,6 +242,21 @@
+     def load_model(
+         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
+     ) -> nn.Module:
++        # gguf-rco draft bridge: a speculative draft named by a path to a .gguf
++        # file never passes through the engine-args normalisation the target
++        # gets, so `model` still names the file itself. Code that reads a
++        # sibling of the checkpoint - DFlash2's optional mask_embedding.pt -
++        # then treats that path as a hub repo id and raises instead of finding
++        # nothing. Normalise it the same way the target is normalised: the
++        # weights name the file, `model` names the directory beside it.
++        _ref = model_config.model_weights or model_config.model
++        if _ref and str(_ref).endswith(".gguf"):
++            from pathlib import Path as _P
++
++            if not model_config.model_weights:
++                model_config.model_weights = str(_ref)
++            if str(model_config.model).endswith(".gguf"):
++                model_config.model = str(_P(str(_ref)).parent)
+         if not _is_gguf_model(model_config):
+             # gguf-rco draft bridge: the draft's VllmConfig is a copy of the
+             # target's and carries the target's GGUF quant config; give the
+--- a/vllm_gguf_plugin/quantization/params.py
++++ b/vllm_gguf_plugin/quantization/params.py
+@@ -23,11 +23,35 @@
+     layer: torch.nn.Module,
+     fallback_weight_loader=None,
+ ):
+-    return (
+-        layer.weight_loader_v2
+-        if hasattr(layer, "weight_loader_v2")
+-        else fallback_weight_loader
+-    )
++    if hasattr(layer, "weight_loader_v2"):
++        return layer.weight_loader_v2
++    if fallback_weight_loader is None:
++        return None
++
++    def _gguf_weight_loader_v1(param, loaded_weight, loaded_shard_id=None):
++        """Store into a GGUF parameter on layers that have no v2 loader.
++
++        ReplicatedLinear - which DFlash2 uses for its fused `fc` - ships a
++        weight_loader that copies straight into ``param.data``. For a GGUF
++        weight that data is the empty placeholder until the packed tensor
++        materialises it, so the copy asserts on the shape. Route it through
++        the parameter's own store, exactly as the weight-type loader does.
++        """
++        if hasattr(param, "_store"):
++            if loaded_shard_id is None:
++                param._store(loaded_weight)
++            elif isinstance(loaded_shard_id, tuple):
++                for shard_id in loaded_shard_id:
++                    param._store(loaded_weight, shard_id=shard_id)
++            else:
++                param._store(loaded_weight, shard_id=loaded_shard_id)
++            return
++        if loaded_shard_id is None:
++            fallback_weight_loader(param, loaded_weight)
++        else:
++            fallback_weight_loader(param, loaded_weight, loaded_shard_id)
++
++    return _gguf_weight_loader_v1
+ 
+ 
+ def _resolve_gguf_weight_type_loader(
+--- a/vllm_gguf_plugin/quantization/config.py
++++ b/vllm_gguf_plugin/quantization/config.py
+@@ -56,8 +56,11 @@
+ 
+     @classmethod
+     def from_config(cls, config: dict[str, Any]) -> "GGUFConfig":
+-        del config
+-        return cls()
++        # A draft model does not share the engine's quant config: vLLM builds it
++        # a fresh one from the draft's own checkpoint (`get_draft_quant_config`),
++        # so whatever the loader appends to the engine's list never reaches it.
++        # Let the checkpoint carry its own unquantised modules instead.
++        return cls(list(config.get("unquantized_modules") or []))
+ 
+     @classmethod
+     def override_quantization_method(
+--- a/vllm_gguf_plugin/weights_adapter/__init__.py
++++ b/vllm_gguf_plugin/weights_adapter/__init__.py
+@@ -10,6 +10,7 @@
+     ZImageDiffusionGGUFAdapter,
+     get_diffusion_gguf_adapter,
+ )
++from .dflash import DFlash2GGUFAdapter
+ from .gemma3 import Gemma3GGUFAdapter
+ from .gemma4 import Gemma4GGUFAdapter
+ from .olmoe import OLMoEGGUFAdapter
+@@ -17,6 +18,7 @@
+ from .transformers import TransformersGGUFWeightsAdapter
+ 
+ _ADAPTER_REGISTRY: list[type[BaseGGUFWeightsAdapter]] = [
++    DFlash2GGUFAdapter,
+     Gemma3GGUFAdapter,
+     Gemma4GGUFAdapter,
+     OLMoEGGUFAdapter,
+--- /dev/null
++++ b/vllm_gguf_plugin/weights_adapter/dflash.py
+@@ -0,0 +1,217 @@
++# SPDX-License-Identifier: Apache-2.0
++
++"""DFlash2 block drafter stored in llama.cpp's `dflash` GGUF architecture.
++
++The published GGUF builds (z-lab/Qwen3.8-27B-DFlash2-GGUF and its mirrors) are
++not a repack of the HF checkpoint: llama.cpp PR #27342 gave DFlash its own
++architecture, so the file carries `general.architecture = dflash`, a `dflash.*`
++metadata namespace and llama.cpp tensor names. This adapter maps that naming
++onto the names `DFlash2DraftModel` loads, so vLLM can serve the same file.
++
++The GGUF quantises the candidate selector (Q4_K on `selector_hidden` and both
++codebooks); the compressed-tensors W4A16 build leaves those modules out of
++quantisation entirely. The two files are therefore not bit-equivalent drafters.
++"""
++
++from __future__ import annotations
++
++import re
++
++from typing import TYPE_CHECKING
++
++from vllm.logger import init_logger
++from vllm.model_executor.models.utils import WeightsMapper
++
++from ..gguf_files import GGUFModelFiles
++from ..weight_utils import get_gguf_tensor_names
++from .base import BaseGGUFWeightsAdapter, GGUFWeight
++
++if TYPE_CHECKING:
++    from collections.abc import Iterable
++
++    from transformers import PretrainedConfig
++    from vllm.config import ModelConfig
++
++logger = init_logger(__name__)
++
++DFLASH_ARCHITECTURE = "DFlash2DraftModel"
++
++#: The six tensors outside the five blocks. `enc.output_norm` normalises the
++#: encoded target hidden state (HF `hidden_norm`); `output_norm` is the
++#: drafter's own final norm (HF `norm`).
++DFLASH_EXACT: dict[str, str] = {
++    "enc.output_norm.weight": "hidden_norm.weight",
++    "output_norm.weight": "norm.weight",
++    "fc.weight": "fc.weight",
++    "selector_hidden.weight": "candidate_selector.hidden_projection.weight",
++    "selector_predecessor.weight": "candidate_selector.predecessor_codebook",
++    "selector_successor.weight": "candidate_selector.successor_codebook",
++}
++
++DFLASH_SUBSTR: dict[str, str] = {
++    "attn_norm.": "input_layernorm.",
++    "ffn_norm.": "post_attention_layernorm.",
++    "attn_q_norm.": "self_attn.q_norm.",
++    "attn_k_norm.": "self_attn.k_norm.",
++    "attn_q.": "self_attn.q_proj.",
++    "attn_k.": "self_attn.k_proj.",
++    "attn_v.": "self_attn.v_proj.",
++    "attn_output.": "self_attn.o_proj.",
++    "attn_conv_base": "attention_conv.base_kernel",
++    "attn_conv_proj.": "attention_conv.kernel_projection.",
++    "ffn_conv_base": "mlp_conv.base_kernel",
++    "ffn_conv_proj.": "mlp_conv.kernel_projection.",
++    "ffn_gate.": "mlp.gate_proj.",
++    "ffn_up.": "mlp.up_proj.",
++    "ffn_down.": "mlp.down_proj.",
++}
++
++
++def build_dflash_mapper() -> WeightsMapper:
++    return WeightsMapper(
++        orig_to_new_prefix={"blk.": "layers."},
++        orig_to_new_substr=DFLASH_SUBSTR,
++    )
++
++
++#: llama.cpp quantises these; vLLM's DFlash2 builds them dense, matching the
++#: reference checkpoint, whose compressed-tensors config lists
++#: `re:.*kernel_projection$` and `re:.*candidate_selector.*` under `ignore`.
++#: Their weights are dequantised on the way in so the dense parameters fit.
++DFLASH_DENSE_IN_VLLM: tuple[str, ...] = (
++    "attention_conv.kernel_projection",
++    "mlp_conv.kernel_projection",
++    "candidate_selector.",
++    # The QKV projections as well, for a different reason: DFlash2 fuses them
++    # into `qkv_proj` and then reads the dense K/V rows out of it while still
++    # inside `load_weights` (`_build_fused_kv_buffers` ->`_dense_kv_rows`),
++    # which runs before `process_weights_after_loading` materialises a GGUF
++    # parameter. A quantised qkv_proj is therefore an uninitialised placeholder
++    # at exactly the moment the model reads it. The compressed-tensors build
++    # escapes this because its parameter is named `weight_packed`, so the
++    # model's `getattr(qkv, "weight", None)` returns None and it takes the
++    # unpacking branch instead.
++    "self_attn.q_proj",
++    "self_attn.k_proj",
++    "self_attn.v_proj",
++)
++
++#: `is_layer_skipped_gguf` compares in OPPOSITE directions in its two branches:
++#: for a layer listed in `packed_modules_mapping` the entry must CONTAIN the
++#: shard prefix, for every other layer the entry must be CONTAINED IN the
++#: prefix. DFlash2's `qkv_proj` is not in that mapping, so it takes the second
++#: branch and needs a short entry that appears inside every block's path.
++DFLASH_DENSE_FUSED: tuple[str, ...] = ("self_attn.qkv_proj",)
++
++
++def _is_dense_in_vllm(name: str) -> bool:
++    return any(part in name for part in DFLASH_DENSE_IN_VLLM)
++
++
++def _dequantize(packed, qtype: int, dtype):
++    import gguf
++    import numpy as np
++    import torch
++
++    raw = packed.cpu().numpy()
++    if raw.dtype != np.uint8:
++        raw = raw.view(np.uint8)
++    out = gguf.quants.dequantize(raw, gguf.GGMLQuantizationType(qtype))
++    return torch.from_numpy(np.ascontiguousarray(out)).to(dtype)
++
++
++def _transform(weights, dtype):
++    """Drop the type tag of a dense-in-vLLM tensor and dequantise its data.
++
++    The weight iterator emits `<name>.weight_type` before the packed bytes,
++    keyed on the tensor's type in the file alone. A name without "weight" in
++    it - the selector codebooks - gets the tag under its own name, so the
++    first sighting is the tag and the second is the data.
++    """
++    pending: dict[str, int] = {}
++    for name, weight in weights:
++        if not _is_dense_in_vllm(name):
++            yield name, weight
++            continue
++        base = name.removesuffix(".weight_type").removesuffix(".weight")
++        if name.endswith(".weight_type") or (base not in pending and weight.numel() == 1):
++            pending[base] = int(weight.reshape(-1)[0].item())
++            continue
++        qtype = pending.pop(base, None)
++        yield name, (weight if qtype is None else _dequantize(weight, qtype, dtype))
++
++
++class DFlash2GGUFAdapter(BaseGGUFWeightsAdapter):
++    """Adapter for DFlash2 draft models in llama.cpp's `dflash` GGUF layout."""
++
++    @classmethod
++    def matches(cls, config) -> bool:
++        # `model_type` is plain "qwen3" on this checkpoint, so the draft config
++        # is what identifies it.
++        if getattr(config, "dflash_config", None) is not None:
++            return True
++        return DFLASH_ARCHITECTURE in (getattr(config, "architectures", None) or [])
++
++    @classmethod
++    def architecture(cls, config: PretrainedConfig) -> str | None:
++        del config
++        return DFLASH_ARCHITECTURE
++
++    def build_name_map(
++        self,
++        files: GGUFModelFiles,
++        model_config: ModelConfig,
++    ) -> dict[str, str]:
++        mapper = build_dflash_mapper()
++        name_map: dict[str, str] = {}
++        unmapped: list[str] = []
++        for name in sorted(get_gguf_tensor_names(files.backbone)):
++            if name in DFLASH_EXACT:
++                name_map[name] = DFLASH_EXACT[name]
++                continue
++            mapped = mapper.apply_list([name])[0]
++            if mapped == name:
++                unmapped.append(name)
++            else:
++                name_map[name] = mapped
++        if unmapped:
++            raise RuntimeError(
++                f"No HF name for {len(unmapped)} dflash tensor(s): {unmapped}. "
++                "The GGUF layout does not match this adapter."
++            )
++        # The modules `transform_weights` dequantises must also be declared
++        # unquantised, or the layer still gets a GGUF method, registers a
++        # `weight_type` parameter, and nothing ever fills it - the load then
++        # fails on an uninitialised parameter.
++        #
++        # `is_layer_skipped_gguf` tests `prefix in module_name` here, so an
++        # entry has to CONTAIN the prefix the model builds with; a shorter
++        # entry never matches. Two things differ from the checkpoint's names:
++        # the module tree adds a `model.` root, and the draft's blocks are
++        # numbered AFTER the target's, so block 0 of a 5-block draft on a
++        # 64-layer target is `model.layers.64.`. `num_target_layers` carries
++        # that offset. Both numberings are declared, so neither assumption can
++        # silently miss.
++        hf = getattr(model_config, "hf_config", None)
++        offset = int(getattr(hf, "num_target_layers", 0) or 0) if hf is not None else 0
++        dense: set[str] = set()
++        for mapped in name_map.values():
++            if not _is_dense_in_vllm(mapped):
++                continue
++            base = mapped.removesuffix(".weight")
++            dense.add(base)
++            m = re.match(r"layers\.(\d+)\.(.*)", base)
++            if m and offset:
++                dense.add(f"layers.{int(m.group(1)) + offset}.{m.group(2)}")
++        self.extra_unquantized_modules = tuple(
++            sorted(dense | {f"model.{name}" for name in dense} | set(DFLASH_DENSE_FUSED))
++        )
++        logger.info("Loading DFlash2 draft from GGUF: %d tensors mapped", len(name_map))
++        return name_map
++
++    def transform_weights(
++        self,
++        weights: Iterable[GGUFWeight],
++        model_config: ModelConfig,
++    ) -> Iterable[GGUFWeight]:
++        return _transform(weights, model_config.dtype)

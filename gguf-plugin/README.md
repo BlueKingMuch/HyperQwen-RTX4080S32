@@ -2,7 +2,7 @@
 
 The target's non-uniform GSQ-RCO quantizations exist only as GGUF, and vLLM
 reads GGUF through an out-of-tree plugin. This directory is what it takes to get
-that plugin to serve them: the plugin fetched at a pinned commit, ten patches,
+that plugin to serve them: the plugin fetched at a pinned commit, eleven patches,
 twenty-six Gluon decode kernels (eleven tile types on the grouped one), a CPU gate
 that says the result installed, and a GPU check of the four K-quant / Q8_0 tile types.
 
@@ -44,7 +44,7 @@ They answer different questions, which is why there are three:
 |---|---|
 | `SHA256SUMS` | what this repo carries is what was reviewed |
 | the archive's sha256 | upstream's bytes at the pin are the bytes being patched |
-| before / after, six files | the files the series touches entered and left in the exact states it was cut for |
+| before / after | the files the series touches entered and left in the exact states it was cut for |
 
 The third is the one worth having. A patch that lands somewhere plausible but
 wrong still applies; it fails here instead of in a kernel.
@@ -53,14 +53,14 @@ What has actually been run, on a pristine fetch of the pin:
 
 - archive sha256 matches
 - the six before-hashes match
-- all ten patches apply with `--fuzz 0`
-- the six after-hashes match
+- all eleven patches apply with `--fuzz 0`
+- the ten after-hashes match
 - the batched-dispatch marker is present
 
 ## The pin
 
 `vllm-project/vllm-gguf-plugin` at `d4c1f0d082fc`, archive sha256
-`c225ff0a282e…`. Apache-2.0; the ten patches in `patches/` are derivative works
+`c225ff0a282e…`. Apache-2.0; the eleven patches in `patches/` are derivative works
 of it and carry that licence with them. The Gluon kernels in `gluon/` are ours.
 
 The sha256 protects integrity, not availability: if that archive stops being
@@ -88,6 +88,7 @@ plugin's matmul — they are files, not a patch, so they are not in `series`.
 | gguf-iq3s-tiles-only | the tiled path narrowed to where it wins |
 | gguf-tiles-all-types | the tile-major form for the remaining int8 types |
 | gguf-tiles-grouped | one kernel and one launch for a layer of mixed-type shards, with the 16/32-row choice at launch time |
+| gguf-dflash2-draft-gguf | a DFlash2 drafter read from llama.cpp's `dflash` GGUF architecture: the name map, the modules llama.cpp quantises but vLLM builds dense, and a draft quant config built from the draft's own checkpoint rather than the engine's |
 
 The `gguf-rco step 6a` … `6h` markers the patches insert into the plugin's source
 are what `test_gguf_rco_cpu.py` greps for. They are load-bearing, and the patch
