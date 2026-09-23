@@ -1,105 +1,204 @@
 # HyperQwen on an RTX 4080 SUPER (32 GB)
 
-A personal experiment fork of [syv-ai/HyperQwen](https://github.com/syv-ai/HyperQwen),
-kept public in case it is useful to someone else with an Ada card. 
-Everything that makes this work is upstream. 
-What happens here is one card, one setup, and what I can measure on it.
+This is my experimental fork of [`syv-ai/HyperQwen`](https://github.com/syv-ai/HyperQwen),
+focused on running and profiling it on a 32 GB RTX 4080 SUPER.
 
-**This is a vibed fork and may be abandoned at any time.** 
-For a maintained project, a working install and the documentation, go upstream. 
-Start with its [README](https://github.com/syv-ai/HyperQwen#readme). 
-If anything here turns out to be worth keeping, the maintainer is welcome to take it; that is what the fork
-link is for.
+Most of the actual work is upstream. This repo contains the changes, experiments, and
+measurements that came out of running it on my setup. I'm keeping it public in case any of
+it is useful to other Ada users.
 
-## The card
+This is very much an experimental fork, almost completely vibe-coded, and I may stop working
+on it at any point. If you want a maintained project, a known-good installation path, or
+general documentation, use upstream and start with its [README](https://github.com/syv-ai/HyperQwen#readme).
 
-RTX 4080 SUPER 32 GB (sm89, Ada), capped at 250 W and undervolted, Windows 11 with WSL2 and Docker. 
+If something from this fork is useful upstream, feel free to take it.
 
-Upstream's published numbers are an RTX 3090 (sm86), so the question this fork exists to answer is what transfers and what does not.
+## Hardware and workload
 
-First data point, upstream's own harness at `c0c81bb`, second run, setup B:
-[field report #149](https://github.com/syv-ai/HyperQwen/issues/149).
+My setup:
 
-Single stream lands a few percent below the 3090 reference because decode is bandwidth-bound there and the 3090 has more of it.
-Four and eight concurrent requests run roughly a third faster. GSM8K 0.960.
+* RTX 4080 SUPER 32 GB (sm89, Ada)
+* 250 W power limit, undervolted
+* Windows 11
+* WSL2 + Docker
 
-## What is different here
+Upstream's published numbers are from an RTX 3090 (sm86), so one of the main reasons for
+this fork was simply to see how the same setup behaves on Ada.
 
-Three things, all in the build, all off unless something turns them on.
+The first baseline is upstream's own harness at `c0c81bb`, second run, setup B:
 
-**vLLM 0.29.0 instead of 0.28.** Upstream's own port
-([syv-ai/HyperQwen#148](https://github.com/syv-ai/HyperQwen/pull/148)) is the
-base; `patches/series` carries its 38 entries and then nine more under an
-`# --- Ada additions ---` header. `patches/check_vllm_series.sh` takes all 47
-against a pristine `v0.29.0` and reports 46 applied with exact context, 5 of them
-at an offset, 0 with fuzz. Eight further patches from the same branch are not
-carried because upstream's series already does the same thing;
-[PATCHES.md](PATCHES.md) names each one.
+**[field report #149](https://github.com/syv-ai/HyperQwen/issues/149)**
 
-**`fp8/` — four FP8 Triton attention steps.** `CTX=fp8` (single-user) or
-`KV=fp8triton` (batch) serves the fp8 KV cache on the Triton backend with
-full-causal attention, a flat prefill index mapping, 32 parallel softmax
-segments instead of 16, and V stored as one 32-token tile per chunk inside a KV
-block. All four default off and `verify.sh` checks that in the live environment
-registry. They apply to one geometry — 24 query heads, 4 KV heads, head_dim 256,
-block 896, sm89 — and on any other backend or dtype the original loops run.
-What the dtype buys on this card is the pool: 308,331 KV tokens against bf16's
-68,605 at the same 64k window. [fp8/README.md](fp8/README.md) has the pins, the
-reverse-byte proofs, and the one place where vLLM 0.29's scratch pool had to
-learn a second segment count.
+Single-stream performance is a few percent below the published 3090 reference. At four and
+eight concurrent requests, the 4080 SUPER is roughly a third faster. GSM8K scores 0.960.
 
-**`CTX=int4` — the int4 per-token-head KV cache on the Triton backend.** Two
-patches under the same header: the verify kernel feeds Q and K to the tensor
-cores as int8 and P and V as bf16 instead of fp32 on TF32, in one query block
-per request (kernel per launch at 100k: 1.964 ms to 0.690, against the bf16
-split-KV kernel's 0.714; 0.187 to 0.0082 rel. RMS against an fp32 reference),
-and prefill chunks dequantize the request's cached K/V per layer and run
-FlashAttention-2 on it (first 100k prefill 165 s to 79, bf16 77). The DFlash2
-drafter keeps an int8 per-token-head cache, whose page divides the int4 page
-at block 1696. On this card the arm decodes 100k context at 39.9 ms per step
-against bf16's 39.5 with 574,889 KV tokens at a 262k window; GSM8K over 200
-questions 0.945-0.955 against bf16's 0.965.
+While I tried to keep it comparably fast, single-stream decode isn't really the workload
+I'm optimizing for, though.
 
-**`gguf-plugin/` — the out-of-tree GGUF plugin, installed by default.** Pinned
-commit, ten patches, twenty-six Gluon decode kernels (eleven tile types on the
-grouped one, whose wide form runs the prefill chunks' GEMMs on int8 tensor cores
-from the tiles instead of dequantising them: a cold 100k prefill of the ByteShape
-GPU-5 file falls from 90.4 s to 69.6 s), its CUDA extension built for sm_89 and
-sm_120 at image build. None of the plugin's source is carried
-here; `install.sh` fetches the archive and checks its sha256. It costs nothing at
-run time until a `MODEL=` path ends in `.gguf`, which is the whole of the
-plugin's claim on a model. The weights are not produced by this repository.
+This machine serves agentic workloads that fan out into multiple subagents: several
+concurrent streams, long contexts, and mostly prefix-cached follow-up requests. That's the
+workload the changes in this fork are aimed at.
 
-`docker compose build` builds all of it and `verify.sh --install` is the gate.
-`docker-compose.yml` builds locally rather than pulling upstream's published
-image, because that image is a different stack under a name that looks like this
-one.
+## What's different
 
-## What it measures
+There are two main areas of work.
 
-[docs/reproductions/ada-029-fp8-gguf.md](docs/reproductions/ada-029-fp8-gguf.md)
-has six arms, each started cold in its own project, with the numbers and the
-configuration that produced them.
+### GGUF and the Gluon kernels
 
-The short version, on this card:
+The GGUF work originally started with the
+[GSQ-RCO](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF) checkpoint. Its
+non-uniform quantizations are only available as GGUF, and the existing paths weren't fast
+enough for the workload I wanted to run.
 
-- **`CTX=fast` is unchanged** by any of the above. The additions cost it nothing.
-- **`CTX=fp8`** reaches 504 tok/s decode at eight concurrent requests against
-  396, with mean TTFT at 888 ms against 3,172, and a 4.5x KV pool. Its GSM8K in
-  four runs was 0.915 / 0.955 / 0.960 / 0.965, where bf16 and int8 stayed inside
-  0.950 to 0.965.
-- **`CTX=long`**, upstream's arm and untouched here, reaches 736 tok/s decode at
-  eight concurrent requests, the highest of any arm measured here.
-- **The GSQ-RCO IQ3_S checkpoint**, served through the plugin, is 5.6% faster at
-  one concurrent request and 39% slower at eight, with GSM8K indistinguishable
-  from W4A16 and 62% more KV pool at the same memory quota. That comparison is
-  one variable: same image, same envelope, different weights.
+That led to the out-of-tree plugin and the Gluon kernels with eleven GGML quantization types
+held in a tile-major layout and run by one grouped kernel, with the launch shape chosen by
+the row count of the batch.
 
-The token cap the quality harness uses truncates 5 to 9 of its 200 questions in
-every arm measured here, including the baseline.
+ByteShape's [GPU-5](https://huggingface.co/byteshape/Qwen3.8-27B-GGUF) file came later. It
+uses eleven quantization types at 3.84 bpw and is intended to stay closer to the unquantized
+model. That's the checkpoint I'm currently using/testing.
 
-## Licence
+Both files load and work, but their type mixes differ, which changes which path individual layer
+shards take. Results from one checkpoint therefore shouldn't be assumed to apply to the
+other, because I also had to learn this the hard way: just because a byte format is smaller
+does not mean the GPU can work with it faster.
 
-Apache-2.0, inherited from upstream. The Qwen3.8-27B weights and the quantised
-checkpoints used here publish under Apache-2.0 as well, and the patches carried
-here are derivative works of vLLM, also Apache-2.0.
+
+Layouts, register tables, per-shape measurements, and profiles are in
+[`gguf-plugin/README.md`](gguf-plugin/README.md).
+
+The plugin source itself isn't vendored into this repository. `install.sh` downloads the
+archive and verifies its SHA-256. It has no runtime effect unless `MODEL=` points to a
+`.gguf` file.
+
+### Ada-specific experiments
+
+This fork also carries a few experiments specifically for my 4080 SUPER setup:
+
+* vLLM 0.29.0 instead of 0.28 — upstream's own port
+  ([syv-ai/HyperQwen#148](https://github.com/syv-ai/HyperQwen/pull/148)) is the base, and
+  this fork adds nine patches on top of its 38 ([`PATCHES.md`](PATCHES.md))
+* int4 per-token-head KV cache on the Triton backend via `CTX=int4`
+* four FP8 Triton attention changes under [`fp8/`](fp8/README.md)
+
+The attention changes and the int8 layer-select path are off unless something turns them on,
+and `verify.sh` checks that behaviourally, against the live environment registry rather than
+against the source text.
+
+These changes are deliberately narrow.
+
+They were tuned and measured on one GPU: an sm89 RTX 4080 SUPER with 32 GB VRAM, a 250 W
+power limit, and an undervolt.
+
+The attention changes only apply to this geometry:
+
+* 24 query heads
+* 4 KV heads
+* head dimension 256
+* block size 896
+
+For other backends or dtypes, the original paths are used.
+
+A 4090 shares the Ada architecture, but it has different memory capacity and bandwidth. 
+I don't have one, so the numbers in this repository should not be treated as 4090 or other
+cards' results.
+
+## Three checkpoints, one envelope
+
+Everything below was measured on this machine with the same serving configuration,
+one checkpoint at a time. In config, only `MODEL=` differed between the runs, 
+but following stayed the same:
+
+* `CTX=int4` — int4 per-token-head KV cache on the Triton backend
+* `SPEC=dflash2` with 7 draft tokens and an int8 per-token-head drafter cache
+* `MAX_SEQS=8`, `GPU_UTIL=0.88`, `max_num_batched_tokens` 2048
+* `max_model_len` 262,144, prefix caching on, `MAMBA_SSM_DTYPE=bfloat16`
+* vision tower loaded
+
+The full annotated configuration is [`.env.example`](.env.example).
+
+### Speed
+
+`bench/run_benchmarks.sh single`, the harness from upstream: one warm-up run, then
+the run that counts. End-to-end tok/s.
+
+| | GPU-5 | GSQ-RCO IQ3_S | W4A16 AutoRound-fast |
+| --------------- | ---------------: | ------------: | -------------------: |
+| C1 T=default    |           101.28 |        108.22 |               108.25 |
+| C2 T=default    |           162.99 |        165.05 |               173.93 |
+| C4 T=default    |           274.47 |        280.10 |               318.61 |
+| C8 T=default    |           348.29 |        350.96 |               409.42 |
+| C1 T=0          |           104.20 |        114.06 |               115.30 |
+| C2 T=0          |           176.61 |        181.78 |               186.17 |
+| C4 T=0          |           301.75 |        298.28 |               328.64 |
+| C8 T=0          |           423.21 |        388.41 |               387.96 |
+| cold 100k prefill |          72.5 s |        72.8 s |               80.0 s |
+| KV pool at 262,144 |        610,029 |       636,735 |              574,889 |
+
+
+### Quality
+
+GSM8K is `bench/quality_battery.py --gsm-only`, n=200. IFBench is 300 prompts per
+run, prompt-level, reported as the harness reports it: strict / loose.
+
+| | GPU-5 | GSQ-RCO IQ3_S | W4A16 AutoRound-fast |
+| ------------------ | ----------: | ----------: | ----------: |
+| GSM8K              |       0.960 |       0.950 |       0.970 |
+| IFBench, no thinking | 41.3 / 43.0 | 38.0 / 41.7 | 41.0 / 43.3 |
+| IFBench, low       | 59.0 / 68.0 | 56.3 / 67.3 | 53.0 / 61.7 |
+| IFBench, medium    | 59.3 / 67.0 | 56.3 / 66.3 | 57.7 / 66.3 |
+| IFBench, xhigh     | 75.7 / 83.3 | 74.3 / 82.0 | 72.3 / 79.7 |
+
+The gap between the strict and the loose column is small without thinking and large
+with it. IFBench's loose scoring accepts a response with its first or last line
+removed; a reasoning parser leaves the separator newlines in front of the answer,
+and strict scoring counts those.
+
+## Benchmarks and reproductions
+
+Measured runs are under [`docs/reproductions/`](docs/reproductions/README.md).
+
+Each run starts cold in its own project and includes the configuration used to produce it.
+
+Additional notes and results:
+
+* [`docs/long-context.md`](docs/long-context.md)
+* [`docs/benchmarks.md`](docs/benchmarks.md)
+
+I'm trying to keep measured results separate from assumptions here. If a number isn't backed
+by a run in the repository, it shouldn't be treated as a benchmark result.
+
+## Building
+
+`single` and `batch` sit behind Compose profiles, so the one command that builds the image
+and starts the server is:
+
+`docker compose --profile single up -d`
+
+`pull_policy: build` means it rebuilds whenever the build context changed and reuses the
+layer cache when it did not. To build without starting anything, name the service:
+`docker compose build single`.
+
+The install gate runs inside the build, and against a built image with:
+
+`bash verify.sh --install`
+
+`docker-compose.yml` intentionally builds the image locally instead of pulling upstream's
+published image. The upstream image uses a different stack despite having a similar-looking
+name.
+
+For installation, start with:
+
+[`docs/install.md`](docs/install.md)
+
+Things that broke badly enough to be worth documenting are in:
+
+[`docs/gotchas.md`](docs/gotchas.md)
+
+## License
+
+Apache-2.0, inherited from upstream.
+
+The Qwen3.8-27B weights and the quantized checkpoints used here are also published under
+Apache-2.0. The patches included in this repository are derivative works of vLLM, which is
+Apache-2.0 as well.
