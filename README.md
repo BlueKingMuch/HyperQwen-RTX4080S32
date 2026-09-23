@@ -63,13 +63,38 @@ shards take. Results from one checkpoint therefore shouldn't be assumed to apply
 other, because I also had to learn this the hard way: just because a byte format is smaller
 does not mean the GPU can work with it faster.
 
+Drafters as well: `DRAFT=` now accepts a DFlash2 block drafter as GGUF, in llama.cpp's own
+`dflash` architecture rather than a repack of the HF checkpoint. Tested on this machine
+against the W4A16 drafter it would replace.
 
-Layouts, register tables, per-shape measurements, and profiles are in
+Layouts, register tables, per-shape measurements, profiles, and the patch series are in
 [`gguf-plugin/README.md`](gguf-plugin/README.md).
 
 The plugin source itself isn't vendored into this repository. `install.sh` downloads the
-archive and verifies its SHA-256. It has no runtime effect unless `MODEL=` points to a
-`.gguf` file.
+archive and verifies its SHA-256. It has no runtime effect unless `MODEL=` or `DRAFT=`
+points to a `.gguf` file.
+
+#### Results of tested drafters
+
+Teacher-forced acceptance, `bench/labd_accept.py --chunk 32` at `DFLASH_TOKENS=7`, two runs
+each, as accepted tokens per step. The ladder is Anbeeld's; the second Q4_K_M is z-lab's
+separate conversion of the same drafter, and W4A16 is the drafter the launcher picks when
+`DRAFT=` is empty.
+
+| drafter | copy | code | edit | quote | summary | qa |
+|---|---|---|---|---|---|---|
+| [bf16](https://huggingface.co/Anbeeld/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-bf16.gguf) | 7.93/7.85 | 3.64/3.64 | 1.91/1.91 | 4.32/4.19 | 2.09/2.09 | 2.53/2.53 |
+| [Q8_0](https://huggingface.co/Anbeeld/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q8_0.gguf) | 7.86/7.85 | 3.92/3.92 | 1.91/1.91 | 4.35/4.21 | 2.11/2.11 | 2.42/2.50 |
+| [Q6_K](https://huggingface.co/Anbeeld/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q6_K.gguf) | 7.93/7.94 | 4.00/4.00 | 1.68/1.50 | 4.26/4.25 | 2.06/2.06 | 2.45/2.48 |
+| [Q5_K_M](https://huggingface.co/Anbeeld/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q5_K_M.gguf) | 7.85/7.83 | 3.64/3.64 | 1.91/1.91 | 4.16/4.34 | 2.11/2.11 | 2.41/2.51 |
+| [Q4_K_M](https://huggingface.co/Anbeeld/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | 7.84/7.83 | 3.57/3.57 | 1.97/1.97 | 4.06/4.33 | 2.12/2.12 | 2.42/2.39 |
+| [Q3_K_M](https://huggingface.co/Anbeeld/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q3_K_M.gguf) | 7.93/7.93 | 3.57/3.85 | 1.43/1.43 | 4.21/4.35 | 2.05/2.05 | 2.49/2.52 |
+| [Q2_K](https://huggingface.co/Anbeeld/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q2_K.gguf) | 7.84/7.85 | 2.67/2.67 | 1.91/1.91 | 4.47/4.52 | 1.96/1.96 | 2.30/2.39 |
+| [Q4_K_M, z-lab](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | 7.92/7.93 | 3.85/3.85 | 1.97/1.97 | 4.22/4.26 | 2.10/2.10 | 2.32/2.24 |
+| [W4A16](https://huggingface.co/syvai/Qwen3.8-27B-DFlash2-W4A16) | 7.93/7.92 | 3.57/3.60 | 1.43/1.43 | 4.24/4.24 | 2.14/2.14 | 2.58/2.55 |
+
+I decided to stay on the W4A16 drafter, because it has the best ratio of VRAM footprint to
+quality and speed.
 
 ### Ada-specific experiments
 
