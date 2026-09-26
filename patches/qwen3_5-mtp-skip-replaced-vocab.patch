@@ -1,0 +1,154 @@
+Qwen3.5 MTP: the untied draft embedding and lm_head go on the meta device.
+
+Qwen3_5MTP builds its own embed_tokens (VocabParallelEmbedding) and lm_head
+(ParallelLMHead), each vocab_size x hidden_size: 248,320 x 5,120 on
+Qwen3.8-27B, 2.37 GiB each in bf16. Both proposer paths replace them with the
+target's after loading. load_eagle_model (v1/worker/gpu/spec_decode/eagle/
+utils.py) shares when the draft has no has_own_embed_tokens / has_own_lm_head
+set; _maybe_share_embeddings / _maybe_share_lm_head (v1/spec_decode/
+llm_base_proposer.py) share for a draft without those attributes. The
+embedding is shared only without pipeline parallelism. Qwen3_5MTP.load_weights
+never calls process_eagle_weight, so the flags stay unset. Until the
+replacement the two copies hold device memory. On a GGUF target the plugin's
+MTP adapter maps only the nextn block, so they are never filled; on a
+safetensors target load_weights copies the target's embed_tokens and lm_head
+tensors into them.
+
+When the copy is replaced anyway (embedding: pipeline-parallel world size 1;
+lm_head: last rank) and the head is neither tied to the embedding nor untied
+by the checkpoint (word_embeddings_untied_by_checkpoint), the module is built
+on the meta device without the quant_config, so it takes the unquantized
+embedding method. While those modules are in place, load_weights skips the
+checkpoint tensors under model.embed_tokens. and lm_head.; on a safetensors
+target the weight iterator still reads them (into host memory with the default
+iterators, into device memory with fastsafetensors and instanttensor). Once the
+target's modules have replaced them, load_weights passes those tensors on as
+before. Every other case keeps the previous construction. The truncated draft
+head of qwen3_5-mtp-draft-vocab (model.draft_lm_head) is built and loaded as
+before.
+
+Tested on a mixed checkpoint built for its smaller MTP head:
+Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf with its nextn block (blk.64) taken from
+Qwen3.8-27B-IQ4_XS-3.84bpw.gguf, 177.5 MB (IQ3_XXS, IQ4_XS, Q5_K) instead of
+348.5 MB (Q6_K). With the patch it boots and serves under SPEC=mtp with the
+torch allocator capped at 15.99 GiB (per_process_memory_fraction). Draft
+acceptance, bench/labd_accept.py --chunk 32 at DRAFT_TOKENS=3: 3.630 tokens
+per step against 3.656 for the unmodified file.
+
+Cut against the tree the whole series leaves: qwen3_5_mtp.py is last touched
+by qwen3_5-mtp-draft-vocab.
+
+--- a/model_executor/models/qwen3_5_mtp.py
++++ b/model_executor/models/qwen3_5_mtp.py
+@@ -52,6 +52,18 @@
+ logger = init_logger(__name__)
+ 
+ 
++def _vocab_replaced_by_target(vllm_config: VllmConfig) -> bool:
++    """Whether the draft's lm_head, and without pipeline parallelism its
++    embedding, is built without storage. Both are replaced by the target's after
++    loading; a head tied to the embedding, or untied by the checkpoint, still
++    gets the full construction."""
++    model_config = vllm_config.model_config
++    return not (
++        model_config.hf_text_config.tie_word_embeddings
++        or model_config.word_embeddings_untied_by_checkpoint
++    )
++
++
+ @support_torch_compile(
+     dynamic_arg_dims={
+         "input_ids": 0,
+@@ -81,12 +93,24 @@
+         self.mtp_start_layer_idx = config.num_hidden_layers
+         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
+ 
+-        self.embed_tokens = VocabParallelEmbedding(
+-            self.vocab_size,
+-            config.hidden_size,
+-            quant_config=vllm_config.quant_config,
+-            prefix=maybe_prefix(prefix, "embed_tokens"),
+-        )
++        # Without pipeline parallelism both proposer paths replace this with the
++        # target's embedding after loading (load_eagle_model,
++        # _maybe_share_embeddings), so it is built on the meta device, unquantized,
++        # and Qwen3_5MTP.load_weights skips its checkpoint tensors.
++        if get_pp_group().world_size == 1 and _vocab_replaced_by_target(vllm_config):
++            with torch.device("meta"):
++                self.embed_tokens = VocabParallelEmbedding(
++                    self.vocab_size,
++                    config.hidden_size,
++                    prefix=maybe_prefix(prefix, "embed_tokens"),
++                )
++        else:
++            self.embed_tokens = VocabParallelEmbedding(
++                self.vocab_size,
++                config.hidden_size,
++                quant_config=vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "embed_tokens"),
++            )
+ 
+         # syv patch: vocab-truncated draft head. If the checkpoint ships
+         # mtp_draft_vocab_ids.pt (built by build_draft_vocab.py) the drafter
+@@ -262,7 +286,17 @@
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
+         )
+ 
+-        if get_pp_group().is_last_rank:
++        if get_pp_group().is_last_rank and _vocab_replaced_by_target(vllm_config):
++            # Both proposer paths replace this with the target's lm_head after
++            # loading: the class sets no has_own_lm_head. Built on the meta device,
++            # unquantized; load_weights skips its checkpoint tensors.
++            with torch.device("meta"):
++                self.lm_head = ParallelLMHead(
++                    config.vocab_size,
++                    config.hidden_size,
++                    prefix=maybe_prefix(prefix, "lm_head"),
++                )
++        elif get_pp_group().is_last_rank:
+             self.lm_head = ParallelLMHead(
+                 config.vocab_size,
+                 config.hidden_size,
+@@ -273,6 +307,16 @@
+                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+         else:
+             self.lm_head = PPMissingLayer()
++        # The meta-device modules above by checkpoint name prefix. load_weights
++        # skips a prefix while its module is still the one built here.
++        self._vocab_placeholders = {
++            name_prefix: module
++            for name_prefix, module in (
++                ("model.embed_tokens.", self.model.embed_tokens),
++                ("lm_head.", self.lm_head),
++            )
++            if any(p.is_meta for p in module.parameters())
++        }
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+         # syv patch: vocab-truncated draft head
+@@ -342,6 +386,16 @@
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        current = {
++            "model.embed_tokens.": self.model.embed_tokens,
++            "lm_head.": self.lm_head,
++        }
++        skipped = tuple(
++            name_prefix
++            for name_prefix, module in self._vocab_placeholders.items()
++            if current[name_prefix] is module
++        )
++
+         def remap_weight_names(weights):
+             for name, weight in weights:
+                 # syv patch: skip the truncated draft head when it is disabled
+@@ -354,6 +408,8 @@
+                         name = name.replace("language_model.", "")
+                 else:
+                     continue
++                if name.startswith(skipped):
++                    continue
+                 yield name, weight
+ 
+         loader = AutoWeightsLoader(self)
