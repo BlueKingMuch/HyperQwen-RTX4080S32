@@ -1,0 +1,64 @@
+The MTP draft takes the target's model, model_weights and hf_config_path.
+
+For --speculative-config method "mtp" without a model of its own,
+SpeculativeConfig sets `model` to the target's model_weights, or to its model
+when model_weights is empty, and builds the draft ModelConfig with that path
+as model. The gguf plugin gives a GGUF target two sources: model is the config
+directory (--hf-config-path, the hfconfig/ directory beside the file) and
+model_weights is the .gguf file. The draft ModelConfig got the .gguf file as
+its model. With no config.json beside the file the boot stops at
+"Unrecognized model"; with one, at the image processor lookup
+(get_hf_image_processor_config), where huggingface_hub rejects the file path
+as a repo id (HFValidationError).
+
+When the method is "mtp" and the draft path is the target's, the draft
+ModelConfig now takes the target's model, model_weights and hf_config_path as
+they are. For a target whose model_weights is empty, model is the same path as
+before and model_weights stays empty; the draft reads its config from the
+target's hf_config_path when one is set. A runai_streamer target (model the
+pulled local directory, model_weights the object-storage URI) hands both on
+the same way. Every other method is unchanged.
+
+Cut against stock 0.29.0: of the series above only dflash2-backport.patch
+touches config/speculative.py, and the install skips it.
+
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -1235,8 +1235,24 @@
+                     draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
+                         self.target_model_config.hf_overrides
+                     )
++                # MTP from the target's own checkpoint: the draft takes the
++                # target's config source and weight source as they are. For a
++                # GGUF target they differ: a config directory and the .gguf file.
++                draft_is_target = self.method == "mtp" and self.model == (
++                    self.target_model_config.model_weights
++                    or self.target_model_config.model
++                )
+                 self.draft_model_config = ModelConfig(
+-                    model=self.model,
++                    model=(
++                        self.target_model_config.model
++                        if draft_is_target
++                        else self.model
++                    ),
++                    model_weights=(
++                        self.target_model_config.model_weights
++                        if draft_is_target
++                        else ""
++                    ),
+                     runner="draft",
+                     tokenizer=(
+                         self.model
+@@ -1259,6 +1275,11 @@
+                     max_logprobs=self.target_model_config.max_logprobs,
+                     hf_overrides=draft_hf_overrides,
+                     config_format=self.target_model_config.config_format,
++                    hf_config_path=(
++                        self.target_model_config.hf_config_path
++                        if draft_is_target
++                        else None
++                    ),
+                 )
+ 
+                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)

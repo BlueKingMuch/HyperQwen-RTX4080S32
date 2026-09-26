@@ -86,3 +86,10 @@ bench-sse-keepalive-frames.patch
 # scheduler.py is last touched by engine-completion-log; cut against the tree the
 # whole series above leaves. Replaces gdn-active-runtime-k-width (removed).
 sched-spec-full-width.patch
+
+# --- MTP drafter --------------------------------------------------------------
+# Of the series above only dflash2-backport touches config/speculative.py, and
+# the install skips it.
+spec-mtp-draft-from-target.patch
+# qwen3_5_mtp.py is last touched by qwen3_5-mtp-draft-vocab.
+qwen3_5-mtp-skip-replaced-vocab.patch
